@@ -1,0 +1,101 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Mon May 25 10:59:22 2026
+
+@author: Benjamin Kafin
+"""
+
+SOC_dblflt
+    molecule_dirs=[
+        r'C:/Users/Benjamin Kafin/Documents/VASP/lone/NHC2Au_smaller/SOC/lmaxmix4/NHC_1/Lmax4_Copy_NHC1',
+        r'C:/Users/Benjamin Kafin/Documents/VASP/lone/NHC2Au_smaller/SOC/lmaxmix4/NHC_2/Lmax4_Copy_NHC2'
+    ],
+    # Metal subsystem directory
+    metal_dir=r'C:/Users/Benjamin Kafin/Documents/VASP/lone/NHC2Au_smaller/SOC/lmaxmix4/lone_adatom_1/lmax4',
+    # Full combined system directory
+    full_dir=r'C:/Users/Benjamin Kafin/Documents/VASP/lone/NHC2Au_smaller/SOC/lmaxmix4/NHC2Au_complex',
+    **run_kwargs,
+    )
+
+SOC_dblflt
+    molecule_dirs=[
+        r'C:/Users/Benjamin Kafin/Documents/VASP/lone/NHC2Au_shorter/NHC_1_complex', 
+        r'C:/Users/Benjamin Kafin/Documents/VASP/lone/NHC2Au_shorter/NHC_2_complex'
+    ],
+    # Metal subsystem directory
+    metal_dir=r'C:/Users/Benjamin Kafin/Documents/VASP/lone/NHC2Au_shorter/lone_adatom_1',
+    # Full combined system directory
+    full_dir=r'C:/Users/Benjamin Kafin/Documents/VASP/lone/NHC2Au_shorter/NHC2Au_complex_1',
+    **run_kwargs,
+    )
+
+
+dblflt_ispin1
+    molecule_dirs=[
+        r'C:/Users/Benjamin Kafin/Documents/VASP/lone/NHC2Au_smaller/ispin1/C_left', 
+        r'C:/Users/Benjamin Kafin/Documents/VASP/lone/NHC2Au_smaller/ispin1/C_right'
+    ],
+    # Metal subsystem directory
+    metal_dir=r'C:/Users/Benjamin Kafin/Documents/VASP/lone/NHC2Au_smaller/ispin1/lone_adatom',
+    # Full combined system directory
+    full_dir=r'C:/Users/Benjamin Kafin/Documents/VASP/lone/NHC2Au_smaller/ispin1/NHC2Au_complex',
+    **run_kwargs,
+    )
+
+
+
+
+
+fcc_SOC
+    molecule_dirs=[
+        r'C:/Users/Benjamin Kafin/Documents/VASP/lone/fcc/SOC/NHC/clean_kp551/NHC_complex'
+    ],
+    # Metal subsystem directory
+    metal_dir=r'C:/Users/Benjamin Kafin/Documents/VASP/lone/fcc/SOC/lone_adatom/kp551',
+    # Full combined system directory
+    full_dir=r'C:/Users/Benjamin Kafin/Documents/VASP/lone/fcc/SOC/NHC_complex/kp551',
+    **run_kwargs,
+    )
+    
+full_SOC
+    molecule_dirs=[
+        r'C:/Users/Benjamin Kafin/Documents/VASP/lone/fcc/SOC/NHC/clean_kp551'
+    ],
+    # Metal subsystem directory
+    metal_dir=r'C:/Users/Benjamin Kafin/Documents/VASP/lone/fcc/SOC/surface_adatom/kp551',
+    # Full combined system directory
+    full_dir=r'C:/Users/Benjamin Kafin/Documents/VASP/lone/fcc/SOC/kp551',
+    **run_kwargs,
+    )    
+
+
+fcc_SOC_lmaxmix4
+    molecule_dirs=[
+        r'C:/Users/Benjamin Kafin/Documents/VASP/lone/fcc/SOC/kp551/lmaxmix4/NHC_Copy'
+    ],
+    # Metal subsystem directory
+    metal_dir=r'C:/Users/Benjamin Kafin/Documents/VASP/lone/fcc/SOC/kp551/lmaxmix4/lone_adatom',
+    # Full combined system directory
+    full_dir=r'C:/Users/Benjamin Kafin/Documents/VASP/lone/fcc/SOC/kp551/lmaxmix4/NHC_complex',
+    **run_kwargs,
+    )
+
+
+
+fcc_ispin2
+
+    molecule_dirs=[r'C:/Users/Benjamin Kafin/Documents/VASP/lone/fcc/kpoints551/NHC_c/kpoints551/kp552'],
+    metal_dir=r'C:/Users/Benjamin Kafin/Documents/VASP/lone/fcc/kpoints551/lone_adatom/552',
+    full_dir=r'C:/Users/Benjamin Kafin/Documents/VASP/lone/fcc/kpoints551/NHCAu_complex/dipole_correction/kp552',
+    **run_kwargs,
+    )
+
+    molecule_dirs=[
+        r'C:/Users/Benjamin Kafin/Documents/VASP/lone/fcc/kpoints551/NHC_c/kpoints551/kp552'
+    ],
+    # Metal subsystem directory
+    metal_dir=r'C:/Users/Benjamin Kafin/Documents/VASP/lone/fcc/kpoints551/lone_adatom/552',
+    # Full combined system directory
+    full_dir=r'C:/Users/Benjamin Kafin/Documents/VASP/lone/fcc/kpoints551/NHCAu_complex/dipole_correction/kp552',
+    **run_kwargs,
+    )
