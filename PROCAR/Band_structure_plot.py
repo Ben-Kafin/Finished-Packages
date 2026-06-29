@@ -1,12 +1,5 @@
 # -*- coding: utf-8 -*-
 """
-Created on Mon Jun 29 12:19:18 2026
-
-@author: Benjamin Kafin
-"""
-
-# -*- coding: utf-8 -*-
-"""
 Created on Thu Feb 12 12:45:00 2026
 @author: Benjamin Kafin
 
@@ -204,14 +197,15 @@ class CPUOrbitalBandPlotter:
                 for k_idx in range(len(k_coords)):
                     mags = self.states.get((s_idx, k_idx, b_idx), np.zeros(2000))
 
-                    # Generic accumulation for N filters
-                    type_weights = {t: 0.0 for t in self.filter_types}
+                    # Named (non-None) filter slots only; None slots leave their channel empty.
+                    active_types = [t for t in self.filter_types if t]
+                    type_weights = {t: 0.0 for t in active_types}
                     for ion_i, elem in self.atom_type_map.items():
-                        if elem in self.filter_types:
+                        if elem in type_weights:
                             type_weights[elem] += mags[ion_i-1]
 
-                    # Extract list of weights in the order provided in filter_types
-                    weights = [type_weights[t] for t in self.filter_types]
+                    # Per-position weights; a None/falsy slot contributes 0 to its channel.
+                    weights = [type_weights[t] if t else 0.0 for t in self.filter_types]
                     w_total = sum(weights)
 
                     if w_total > 0:
@@ -230,7 +224,7 @@ class CPUOrbitalBandPlotter:
         base_colors = [[1,0,0], [0,1,0], [0,0,1]]
         legend_elements = [Line2D([0], [0], marker='o', color='w', label=e,
                           markerfacecolor=c, markersize=10)
-                          for e, c in zip(self.filter_types, base_colors)]
+                          for e, c in zip(self.filter_types, base_colors) if e]
         ax.legend(handles=legend_elements, title="Atomic Projections", loc='upper right')
 
         ax.axhline(0, color='red', ls='-', lw=0.8, alpha=0.5)
