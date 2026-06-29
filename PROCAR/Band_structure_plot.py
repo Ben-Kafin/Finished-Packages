@@ -19,8 +19,8 @@ import re
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
-from matplotlib.widgets import CheckButtons
-from collections import defaultdict
+#from matplotlib.widgets import CheckButtons
+#from collections import defaultdict
 from enum import Enum, auto
 
 
@@ -59,7 +59,7 @@ class CPUOrbitalBandPlotter:
         self.fermi_level = self.parse_doscar(directory)
         self.atom_type_map = self.parse_poscar()
 
-        print(f"--- Initialization Complete ---")
+        print("--- Initialization Complete ---")
         print(f"Fermi Level (from DOSCAR): {self.fermi_level:.4f} eV")
         print(f"Detected Spin Mode: {self.spin_mode.name if self.spin_mode is not None else 'UNKNOWN'}")
         print(f"POSCAR Mapping: {len(self.atom_type_map)} ions found")
@@ -116,7 +116,7 @@ class CPUOrbitalBandPlotter:
     def parse_procar(self):
         """Zero-indexed Magnitude parsing. Skips LORBIT=14 phase blocks."""
         if not os.path.exists(self.procar_path): return
-        print(f"\n>>> Starting Zero-Based PROCAR Parsing...")
+        print("\n>>> Starting Zero-Based PROCAR Parsing...")
 
         with open(self.procar_path, "r") as f:
             content = f.read()
@@ -182,7 +182,7 @@ class CPUOrbitalBandPlotter:
 
     def plot_colored_bands(self):
         """Renders scatter points with full hue normalization for ANY provided elements."""
-        print(f"\nGenerating Generic Normalized Band Plot...")
+        print("\nGenerating Generic Normalized Band Plot...")
         band_raw = self.parse_band_dat()
         fig, ax = plt.subplots(figsize=(12, 8))
         if self.ispin == 2: plt.subplots_adjust(right=0.85)
