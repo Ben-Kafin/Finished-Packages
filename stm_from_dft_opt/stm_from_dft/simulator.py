@@ -511,6 +511,9 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
         # hard-set off here. Restore a control for this flag to re-enable it.
         self.show_dcmp_norm = False
         self.use_angular = False
+        # PowerNorm gamma for all LDOS heatmaps (1.0 = linear; <1 squashes the
+        # colormap toward the minimum). Live-controlled by the bottom-row slider.
+        self.ldos_gamma = 1.0
 
         self.m_colors = ['#1f77b4', '#2ca02c', '#9467bd', '#00ced1', '#e377c2',
                          '#17becf', '#bcbd22', '#7f7f7f', '#8c564b', '#d62728']
@@ -709,12 +712,30 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
         p_dist = np.linspace(0, p_len, self.npts)
         return p_xy, p_dist, p_len, verts
 
+    def _set_textbox_text(self, box, s):
+        """Set a TextBox's displayed text WITHOUT calling set_val().
+
+        matplotlib's TextBox.set_val() triggers cursor re-rendering
+        (_rendercursor -> get_window_extent -> fig.dpi), which raises
+        'NoneType has no attribute dpi' when called re-entrantly from within an
+        on_submit handler, and can leave the mouse grab leaked. Updating the
+        underlying Text artist directly avoids that path entirely.
+        """
+        try:
+            box.text = s
+            box.text_disp.set_text(s)
+            if self.fig is not None and self.fig.canvas is not None:
+                self.fig.canvas.draw_idle()
+        except Exception:
+            pass
+
     def _add_slider_textbox(self, slider, rect, fmt="{:.3f}"):
         """Attach an editable text box mirroring a slider's value.
 
-        Two-way: typing a value (Enter) clamps to the slider range and calls
-        slider.set_val (which fires the slider's existing on_changed). Bad input
-        silently reverts to the current slider value. The slider's built-in value
+        Two-way: typing a complete number (Enter) clamps to the slider range and
+        calls slider.set_val (which fires the slider's existing on_changed).
+        Incomplete/partial input (empty, '-', '+', '.', '-.') is treated as
+        in-progress and the display silently reverts. The slider's built-in value
         text is hidden to avoid a duplicate number.
         """
         try:
@@ -725,14 +746,33 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
         tb = TextBox(ax_tb, "", initial=fmt.format(slider.val))
 
         def _submit(text, s=slider, box=tb, f=fmt):
+            # Guard the whole body so a raised exception can never leave the
+            # TextBox holding the canvas mouse grab (which would lock out every
+            # other widget with 'Another Axes already grabs mouse input').
             try:
-                v = float(text)
-            except (ValueError, TypeError):
-                box.set_val(f.format(s.val))
-                return
-            v = min(max(v, s.valmin), s.valmax)
-            s.set_val(v)
-            box.set_val(f.format(s.val))
+                stripped = (text or "").strip()
+                if stripped in ("", "-", "+", ".", "-.", "+.", "e", "E"):
+                    # partial / in-progress entry: revert display, do nothing
+                    self._set_textbox_text(box, f.format(s.val))
+                    return
+                try:
+                    v = float(stripped)
+                except (ValueError, TypeError):
+                    self._set_textbox_text(box, f.format(s.val))
+                    return
+                v = min(max(v, s.valmin), s.valmax)
+                s.set_val(v)
+                self._set_textbox_text(box, f.format(s.val))
+            except Exception:
+                pass
+            finally:
+                # Release a leaked mouse grab if this textbox's axes holds it.
+                try:
+                    cv = box.ax.figure.canvas
+                    if getattr(cv, 'mouse_grabber', None) is box.ax:
+                        cv.release_mouse(box.ax)
+                except Exception:
+                    pass
 
         tb.on_submit(_submit)
         self._slider_textboxes.append((slider, tb, fmt))
@@ -744,12 +784,141 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
             try:
                 cur = fmt.format(s.val)
                 if box.text != cur:
-                    box.set_val(cur)
+                    self._set_textbox_text(box, cur)
+            except Exception:
+                pass
+
+    def _layout_bottom_row(self, entries):
+        """Evenly distribute the active-mode bottom-row sliders across the full
+        figure width. `entries` is a list of (slider, has_textbox, fmt). Each
+        slot reserves room on its LEFT for the slider's label (matplotlib draws
+        the Slider label to the left of its axes), then the slider, then (if
+        requested) its textbox on the right, with a gap before the next slot so
+        nothing overlaps. Only the widgets active for the current mode are passed
+        in, so the row always spans the whole window.
+        """
+        n = len(entries)
+        if n == 0:
+            return
+        x_start, x_end = 0.215, 0.99      # full usable width right of the left column
+        y0 = 0.045                          # vertical band for the row
+        h = 0.022
+        total = x_end - x_start
+        slot = total / n
+        label_pad = slot * 0.22             # left room for the slider's text label
+        inner_gap = slot * 0.12             # gap between adjacent slots
+        usable = slot - label_pad - inner_gap
+        for i, (slider, has_tb, fmt) in enumerate(entries):
+            sx = x_start + i * slot + label_pad
+            if has_tb:
+                sld_w = usable * 0.62
+                tb_w = usable * 0.30
+                tb_gap = usable * 0.08
+                slider.ax.set_position([sx, y0, sld_w, h])
+                self._add_slider_textbox(slider, [sx + sld_w + tb_gap, y0, tb_w, h], fmt=fmt)
+            else:
+                slider.ax.set_position([sx, y0, usable, h])
+
+    def _build_slider_column(self, cell, label, valinit, on_rerun):
+        """Build a vertical height-slider control as ONE gridspec column.
+
+        `cell` is a SubplotSpec (a single column of the top-row gridspec). The
+        column is subdivided vertically into slider (top) / textbox (middle) /
+        Rerun button (bottom), so the whole control is one entity in the grid and
+        reflows with the plots at any window size. Returns (slider, textbox, btn).
+        """
+        sub = gridspec.GridSpecFromSubplotSpec(
+            3, 1, subplot_spec=cell, height_ratios=[0.62, 0.10, 0.13], hspace=0.45)
+        ax_sld = self.fig.add_subplot(sub[0])
+        ax_tb = self.fig.add_subplot(sub[1])
+        ax_btn = self.fig.add_subplot(sub[2])
+        sld = Slider(ax_sld, label, 0.0, self.tip_height_max,
+                     valinit=valinit, orientation='vertical')
+        # Build the editable textbox on the dedicated axes (reuse the safe
+        # textbox logic but with a pre-made axes).
+        try:
+            sld.valtext.set_visible(False)
+        except Exception:
+            pass
+        ax_tb.set_navigate(False)
+        tb = TextBox(ax_tb, "", initial="{:.3f}".format(sld.val))
+
+        def _submit(text, s=sld, box=tb, f="{:.3f}"):
+            try:
+                stripped = (text or "").strip()
+                if stripped in ("", "-", "+", ".", "-.", "+.", "e", "E"):
+                    self._set_textbox_text(box, f.format(s.val)); return
+                try:
+                    v = float(stripped)
+                except (ValueError, TypeError):
+                    self._set_textbox_text(box, f.format(s.val)); return
+                v = min(max(v, s.valmin), s.valmax)
+                s.set_val(v)
+                self._set_textbox_text(box, f.format(s.val))
+            except Exception:
+                pass
+            finally:
+                try:
+                    cv = box.ax.figure.canvas
+                    if getattr(cv, 'mouse_grabber', None) is box.ax:
+                        cv.release_mouse(box.ax)
+                except Exception:
+                    pass
+
+        tb.on_submit(_submit)
+        self._slider_textboxes.append((sld, tb, "{:.3f}"))
+        btn = Button(ax_btn, 'Rerun', color='lightgray', hovercolor='lime')
+        btn.on_clicked(on_rerun)
+        return sld, tb, btn
+
+    def _disconnect_stale_widgets(self):
+        """Disconnect canvas event callbacks of all widgets from the PREVIOUS
+        build before the figure is cleared.
+
+        fig.clf() detaches widget artists (their .figure becomes None) but does
+        NOT remove the canvas-level event handlers that matplotlib widgets
+        register (TextBox._click, Slider/Button press handlers, etc.). Those
+        stale handlers survive the rebuild and, when later triggered by a click,
+        call get_window_extent() on a detached Text artist -> fig.dpi is None ->
+        'NoneType has no attribute dpi'. Explicitly disconnecting each prior
+        widget's events prevents that.
+        """
+        widgets = []
+        for v in list(self.__dict__.values()):
+            if hasattr(v, 'disconnect_events'):
+                widgets.append(v)
+            elif isinstance(v, dict):
+                for vv in v.values():
+                    if hasattr(vv, 'disconnect_events'):
+                        widgets.append(vv)
+            elif isinstance(v, (list, tuple)):
+                for vv in v:
+                    # _slider_textboxes holds (slider, textbox, fmt) tuples
+                    if isinstance(vv, (list, tuple)):
+                        for w in vv:
+                            if hasattr(w, 'disconnect_events'):
+                                widgets.append(w)
+                    elif hasattr(vv, 'disconnect_events'):
+                        widgets.append(vv)
+        for w in widgets:
+            try:
+                w.disconnect_events()
             except Exception:
                 pass
 
     def _build_ui(self):
+        # Tear down the previous build's widget event handlers BEFORE clearing the
+        # figure, so no stale click handler can fire on a detached (figure=None)
+        # textbox after the rebuild.
+        self._disconnect_stale_widgets()
         self.fig.clf()
+        # fig.clf() destroys the widget axes, but the Python attributes persist.
+        # Drop mode-specific sliders so later hasattr() checks reflect ONLY the
+        # widgets the current mode actually builds (otherwise e.g. a stale
+        # s_nepts from a previous Map view leaks into the Path/Line bottom row).
+        for _attr in ('s_path_pts', 's_nepts'):
+            if hasattr(self, _attr):
+                delattr(self, _attr)
         self.fig.suptitle(self.spin_mode.name, fontsize=12, y=0.995, va='top')
         # Reset textbox registry each rebuild (axes are recreated on fig.clf)
         self._slider_textboxes = []
@@ -774,48 +943,65 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
         self.s_cell = Slider(plt.axes([0.22, 0.05, 0.1, 0.03]), 'Cells', 0, 4, valinit=self.display_cells, valstep=1)
         self.s_emin = Slider(plt.axes([0.50, 0.05, 0.17, 0.02]), 'E Min', -5.0, 5.0, valinit=self.erange[0])
         self.s_emax = Slider(plt.axes([0.50, 0.02, 0.17, 0.02]), 'E Max', -5.0, 5.0, valinit=self.erange[1])
+        # LDOS heatmap colormap gamma (PowerNorm). 1.0 = linear; <1 squashes the
+        # colormap toward the minimum. Present in all modes; placed in the bottom
+        # row by _layout_bottom_row. Only re-colors (no recompute) on change.
+        self.s_ldos_gamma = Slider(plt.axes([0.50, 0.08, 0.17, 0.02]), 'LDOS γ', 0.1, 1.0,
+                                   valinit=self.ldos_gamma, valstep=0.05)
 
-        # Extra Broadening UI
+        # Extra Broadening UI. Each σ slider is only VISIBLE when its checkbox is
+        # checked (toggled live in _on_broadening_change), and is raised above the
+        # plots in zorder so it is never hidden behind one when shown.
         n_types = len(self.atomtypes)
         chk_h = max(0.04, 0.022 * n_types)
         broad_chk_init = [self.extra_broadening.get(t, 0.0) > 0 for t in self.atomtypes]
         broad_y_base = 0.90 - chk_h - 0.01
         self.chk_broad = CheckButtons(plt.axes([0.02, broad_y_base, 0.05, chk_h]), self.atomtypes, broad_chk_init)
         self.s_broad = {}
+        self._sbroad_tb = {}
         for i, t in enumerate(self.atomtypes):
             y_pos = broad_y_base + chk_h - (i + 1) * (chk_h / n_types) + (chk_h / n_types - 0.016) / 2
             ax_s = plt.axes([0.08, y_pos, 0.06, 0.014])
+            ax_s.set_zorder(100)
             init_val = self.extra_broadening.get(t, 0.0)
             self.s_broad[t] = Slider(ax_s, f'σ {t}', 0.0, 1.0, valinit=init_val, valstep=0.01)
             self.s_broad[t].on_changed(self._on_broadening_change)
-            self._add_slider_textbox(self.s_broad[t], [0.145, y_pos, 0.035, 0.014], fmt="{:.2f}")
+            tb = self._add_slider_textbox(self.s_broad[t], [0.145, y_pos, 0.035, 0.014], fmt="{:.2f}")
+            tb.ax.set_zorder(100)
+            self._sbroad_tb[t] = tb
+            # Hidden unless its checkbox is on
+            ax_s.set_visible(broad_chk_init[i])
+            tb.ax.set_visible(broad_chk_init[i])
         self.chk_broad.on_clicked(self._on_broadening_change)
 
-        # --- Global-topo tip-height slider (vertical), present in ALL modes,
-        #     to the right of the top-left global-topo plot. Recompute only on its
-        #     own Rerun button, and only while the main RUN button is active. ---
-        self.s_topo_h = Slider(plt.axes([0.455, 0.55, 0.012, 0.33]), 'Topo h',
-                               0.0, self.tip_height_max, valinit=self.topo_height,
-                               orientation='vertical')
-        self._add_slider_textbox(self.s_topo_h, [0.44, 0.50, 0.045, 0.022], fmt="{:.3f}")
-        self.btn_topo_rerun = Button(plt.axes([0.44, 0.46, 0.045, 0.03]), 'Rerun',
-                                     color='lightgray', hovercolor='lime')
-        self.btn_topo_rerun.on_clicked(self._on_topo_height_rerun)
-
         if self.mode == 'Single Point':
-            self.gs = gridspec.GridSpec(1, 2, width_ratios=[1, 1], wspace=0.25)
-            self.ax_map, self.ax_spec = self.fig.add_subplot(self.gs[0, 0]), self.fig.add_subplot(self.gs[0, 1])
+            # Columns: Global Topo | Topo h | Partitioned LDOS (no LDOS-topo)
+            self.gs = gridspec.GridSpec(1, 3, width_ratios=[1, 0.22, 1], wspace=0.30)
+            self.ax_map = self.fig.add_subplot(self.gs[0, 0])
+            self.ax_spec = self.fig.add_subplot(self.gs[0, 2])
             self.s_num_marks = Slider(plt.axes([0.35, 0.02, 0.1, 0.03]), 'Markers', 1, 10, valinit=len(self.marker_coords), valstep=1)
             self.marks = self.ax_map.scatter([], [], s=150, edgecolors='black', zorder=15, picker=5)
             self.s_num_marks.on_changed(self._on_ui_change)
+            # Global-topo height slider as its own gridspec column.
+            self.s_topo_h, _, self.btn_topo_rerun = self._build_slider_column(
+                self.gs[0, 1], 'Topo h', self.topo_height, self._on_topo_height_rerun)
 
         elif self.mode in ('Line', 'Path'):
             self.gs = gridspec.GridSpec(3, 1, height_ratios=[1, 1, 0.15], hspace=0.35)
-            self.top_gs = gridspec.GridSpecFromSubplotSpec(1, 2, subplot_spec=self.gs[0, 0], width_ratios=[1, 2.5], wspace=0.25)
+            # Top row columns: Global Topo | Topo h | LDOS h | (LDOS-topo cluster).
+            # The cluster (top_gs[3]) is what _update_all rebuilds each refresh;
+            # the two slider columns are built once here and left untouched.
+            self.top_gs = gridspec.GridSpecFromSubplotSpec(
+                1, 4, subplot_spec=self.gs[0, 0], width_ratios=[1, 0.22, 0.22, 2.5], wspace=0.30)
             self.ax_map = self.fig.add_subplot(self.top_gs[0])
-            lgs = gridspec.GridSpecFromSubplotSpec(1, 6, subplot_spec=self.top_gs[1], width_ratios=[1, 0.06, 0.05, 1, 0.03, 0.05], wspace=0.0)
-            self.ax_line_topo = self.fig.add_subplot(lgs[0])
-            self.ax_stripe, self.ax_ldos, self.cax = self.fig.add_subplot(lgs[2]), self.fig.add_subplot(lgs[3]), self.fig.add_subplot(lgs[5])
+            if self.mode == 'Line':
+                lgs = gridspec.GridSpecFromSubplotSpec(1, 6, subplot_spec=self.top_gs[3], width_ratios=[1, 0.06, 0.05, 1, 0.03, 0.05], wspace=0.0)
+                self.ax_line_topo = self.fig.add_subplot(lgs[0])
+                self.ax_stripe, self.ax_ldos, self.cax = self.fig.add_subplot(lgs[2]), self.fig.add_subplot(lgs[3]), self.fig.add_subplot(lgs[5])
+            else:  # Path: no 'Topo' box; keep the strip + LDOS heatmap, filling the cluster
+                self.ax_line_topo = None
+                lgs = gridspec.GridSpecFromSubplotSpec(1, 3, subplot_spec=self.top_gs[3], width_ratios=[0.05, 1, 0.05], wspace=0.0)
+                self.ax_stripe, self.ax_ldos, self.cax = self.fig.add_subplot(lgs[0]), self.fig.add_subplot(lgs[1]), self.fig.add_subplot(lgs[2])
             bot_gs = gridspec.GridSpecFromSubplotSpec(1, 2, subplot_spec=self.gs[1, 0], width_ratios=[2.5, 1], wspace=0.25)
             self.ax_prof = self.fig.add_subplot(bot_gs[0])
             self.ax_spec = self.fig.add_subplot(bot_gs[1])
@@ -832,36 +1018,33 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
                 self.s_path_pts = Slider(plt.axes([0.35, 0.055, 0.1, 0.03]), 'Path Pts', 2, 12,
                                          valinit=len(self.path_nodes), valstep=1)
                 self.s_path_pts.on_changed(self._on_ui_change)
-            # LDOS-topo tip-height slider (vertical), to the LEFT of the LDOS-topo
-            # block (ax_line_topo / ax_stripe).
-            self.s_ldos_h = Slider(plt.axes([0.355, 0.55, 0.012, 0.33]), 'LDOS h',
-                                   0.0, self.tip_height_max, valinit=self.ldos_height,
-                                   orientation='vertical')
-            self._add_slider_textbox(self.s_ldos_h, [0.34, 0.50, 0.045, 0.022], fmt="{:.3f}")
-            self.btn_ldos_rerun = Button(plt.axes([0.34, 0.46, 0.045, 0.03]), 'Rerun',
-                                         color='lightgray', hovercolor='lime')
-            self.btn_ldos_rerun.on_clicked(self._on_ldos_height_rerun)
+            # Order: Global Topo | Topo h | LDOS h | LDOS-topo | ...
+            self.s_topo_h, _, self.btn_topo_rerun = self._build_slider_column(
+                self.top_gs[1], 'Topo h', self.topo_height, self._on_topo_height_rerun)
+            self.s_ldos_h, _, self.btn_ldos_rerun = self._build_slider_column(
+                self.top_gs[2], 'LDOS h', self.ldos_height, self._on_ldos_height_rerun)
 
         elif self.mode == 'Map':
-            self.gs = gridspec.GridSpec(2, 3, height_ratios=[2.5, 1], width_ratios=[1, 1, 4.0], hspace=0.35, wspace=0.05)
+            # Top row columns: Global Topo | Topo h | LDOS h | Map Topo | Part. LDOS
+            # Bottom row spans all columns. Topo plots keep set_aspect('equal') so
+            # the slider columns do not distort them.
+            self.gs = gridspec.GridSpec(2, 5, height_ratios=[2.5, 1],
+                                        width_ratios=[1, 0.22, 0.22, 1, 4.0],
+                                        hspace=0.35, wspace=0.05)
             self.ax_map_global = self.fig.add_subplot(self.gs[0, 0])
-            self.ax_map = self.fig.add_subplot(self.gs[0, 1])
-            self.ax_spec = self.fig.add_subplot(self.gs[0, 2])
+            self.ax_map = self.fig.add_subplot(self.gs[0, 3])
+            self.ax_spec = self.fig.add_subplot(self.gs[0, 4])
             self.map_axes = []
             self.marks = self.ax_map.scatter([], [], s=150, edgecolors='black', zorder=15, picker=5)
             self.s_num_marks = Slider(plt.axes([0.35, 0.02, 0.1, 0.03]), 'Markers', 1, 10, valinit=len(self.marker_coords), valstep=1)
             self.s_nepts = Slider(plt.axes([0.75, 0.035, 0.15, 0.02]), 'E Pts', 1, 20, valinit=5 if self.cached_nepts is None else self.cached_nepts, valstep=1)
             self.s_num_marks.on_changed(self._on_ui_change)
             self.s_nepts.on_changed(self._on_ui_change)
-            # LDOS-topo tip-height slider (vertical), to the LEFT of the local
-            # LDOS-topo map (ax_map).
-            self.s_ldos_h = Slider(plt.axes([0.355, 0.55, 0.012, 0.33]), 'LDOS h',
-                                   0.0, self.tip_height_max, valinit=self.ldos_height,
-                                   orientation='vertical')
-            self._add_slider_textbox(self.s_ldos_h, [0.34, 0.50, 0.045, 0.022], fmt="{:.3f}")
-            self.btn_ldos_rerun = Button(plt.axes([0.34, 0.46, 0.045, 0.03]), 'Rerun',
-                                         color='lightgray', hovercolor='lime')
-            self.btn_ldos_rerun.on_clicked(self._on_ldos_height_rerun)
+            # Order: Global Topo | Topo h | LDOS h | Map Topo (LDOS-topo) | LDOS
+            self.s_topo_h, _, self.btn_topo_rerun = self._build_slider_column(
+                self.gs[0, 1], 'Topo h', self.topo_height, self._on_topo_height_rerun)
+            self.s_ldos_h, _, self.btn_ldos_rerun = self._build_slider_column(
+                self.gs[0, 2], 'LDOS h', self.ldos_height, self._on_ldos_height_rerun)
 
         self.fig.canvas.mpl_connect('pick_event', self._on_pick)
         self.fig.canvas.mpl_connect('motion_notify_event', self._on_motion)
@@ -871,17 +1054,24 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
         self.chk.on_clicked(self._on_ui_change)
         for s in [self.s_cell, self.s_emin, self.s_emax]:
             s.on_changed(self._on_ui_change)
+        # Gamma only re-colors the heatmaps; the cache logic skips recompute since
+        # gamma touches none of the needs_* conditions, so _on_ui_change is cheap.
+        self.s_ldos_gamma.on_changed(self._on_ui_change)
 
-        # Register text boxes for the standard sliders (height sliders already
-        # registered above). E Pts / Markers / Path Pts handled here if present.
-        self._add_slider_textbox(self.s_cell, [0.325, 0.05, 0.04, 0.03], fmt="{:.0f}")
-        self._add_slider_textbox(self.s_emin, [0.675, 0.05, 0.05, 0.02], fmt="{:.3f}")
-        self._add_slider_textbox(self.s_emax, [0.675, 0.02, 0.05, 0.02], fmt="{:.3f}")
-        self._add_slider_textbox(self.s_num_marks, [0.455, 0.02, 0.04, 0.03], fmt="{:.0f}")
+        # Evenly distribute the bottom-row sliders active in THIS mode across the
+        # full figure width, each with an adjacent (non-overlapping) text box.
+        # Order is left-to-right. Only widgets that exist for the current mode
+        # are included, so the row always spans the whole window.
+        bottom_entries = [(self.s_cell, True, "{:.0f}")]
         if hasattr(self, 's_path_pts'):
-            self._add_slider_textbox(self.s_path_pts, [0.455, 0.055, 0.04, 0.03], fmt="{:.0f}")
+            bottom_entries.append((self.s_path_pts, True, "{:.0f}"))
+        bottom_entries.append((self.s_num_marks, True, "{:.0f}"))
         if hasattr(self, 's_nepts'):
-            self._add_slider_textbox(self.s_nepts, [0.905, 0.035, 0.04, 0.02], fmt="{:.0f}")
+            bottom_entries.append((self.s_nepts, True, "{:.0f}"))
+        bottom_entries.append((self.s_emin, True, "{:.3f}"))
+        bottom_entries.append((self.s_emax, True, "{:.3f}"))
+        bottom_entries.append((self.s_ldos_gamma, True, "{:.2f}"))
+        self._layout_bottom_row(bottom_entries)
 
         self.cached_emin, self.cached_emax = None, None
         self._update_all(full_refresh=True)
@@ -977,6 +1167,11 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
     def _on_broadening_change(self, val):
         states = self.chk_broad.get_status()
         for i, t in enumerate(self.atomtypes):
+            # Show the σ slider (and its textbox) only while its checkbox is on.
+            if t in self.s_broad:
+                self.s_broad[t].ax.set_visible(states[i])
+            if t in getattr(self, '_sbroad_tb', {}):
+                self._sbroad_tb[t].ax.set_visible(states[i])
             self.extra_broadening[t] = self.s_broad[t].val if states[i] else 0.0
         self._apply_extra_broadening()
         self._sync_textboxes()
@@ -1000,6 +1195,8 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
         for (label, attr), state in zip(self._toggle_defs, states):
             setattr(self, attr, state)
         self.display_cells = int(self.s_cell.val)
+        if hasattr(self, 's_ldos_gamma'):
+            self.ldos_gamma = float(self.s_ldos_gamma.val)
         self._sync_textboxes()
 
         # Angular toggle OR path-extend toggle: invalidate caches and recompute.
@@ -1421,78 +1618,95 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
                 global_vmax = 1e-15
 
             num_p = max(1, len(partitions))
-            if self.show_dcmp_norm:
-                w_ratios = [1, 0.06, 0.05] + [1, 0.05, 0.1] * num_p
+            # In Line mode the cluster leads with the 'Topo' box + spacer columns
+            # (offset 3) then stripe at index 2. In Path mode the 'Topo' box is
+            # removed: the cluster leads with just the stripe column.
+            if self.mode == 'Line':
+                if self.show_dcmp_norm:
+                    w_ratios = [1, 0.06, 0.05] + [1, 0.05, 0.1] * num_p
+                else:
+                    w_ratios = [1, 0.06, 0.05] + [1, 0.0, 0.0] * (num_p - 1) + [1, 0.05, 0.0]
+                lgs = gridspec.GridSpecFromSubplotSpec(1, 3 + num_p * 3, subplot_spec=self.top_gs[3], width_ratios=w_ratios, wspace=0.0)
+                stripe_idx = 2
+                decomp_base = 3
+            else:  # Path: no Topo box / spacer; stripe leads
+                if self.show_dcmp_norm:
+                    w_ratios = [0.05, 0.05] + [1, 0.05, 0.1] * num_p
+                else:
+                    w_ratios = [0.05, 0.05] + [1, 0.0, 0.0] * (num_p - 1) + [1, 0.05, 0.0]
+                lgs = gridspec.GridSpecFromSubplotSpec(1, 2 + num_p * 3, subplot_spec=self.top_gs[3], width_ratios=w_ratios, wspace=0.0)
+                stripe_idx = 0
+                decomp_base = 2
+
+            if self.mode == 'Line':
+                # Line Topo panel (the unwrapped 'Topo' corridor) — Line mode only.
+                self.ax_line_topo = self.fig.add_subplot(lgs[0])
+                self.line_decomp_axes.append(self.ax_line_topo)
+
+                ax_spacer = self.fig.add_subplot(lgs[1])
+                ax_spacer.axis('off')
+                self.line_decomp_axes.append(ax_spacer)
+
+                v_line = self.p2 - self.p1
+                v_hat = v_line / p_len
+                v_perp = np.array([-v_hat[1], v_hat[0]])
+                half_w = p_len / 2.0
+
+                n_tile = max(int(self.s_cell.val), 1) + 1
+                margin = p_len * 0.15
+                all_rx, all_ry, all_z = [], [], []
+                for i in range(-n_tile, n_tile + 1):
+                    for j in range(-n_tile, n_tile + 1):
+                        off = i * self.lv[0, :2] + j * self.lv[1, :2]
+                        pts = self.grid_xy + off
+                        dx = pts[:, 0] - self.p1[0]
+                        dy = pts[:, 1] - self.p1[1]
+                        rot_x = dx * v_perp[0] + dy * v_perp[1]
+                        rot_y = dx * v_hat[0] + dy * v_hat[1]
+                        mask = (rot_x > -half_w - margin) & (rot_x < half_w + margin) & (rot_y > -margin) & (rot_y < p_len + margin)
+                        all_rx.append(rot_x[mask])
+                        all_ry.append(rot_y[mask])
+                        all_z.append(self.global_z_map[mask])
+                all_rx, all_ry, all_z = np.concatenate(all_rx), np.concatenate(all_ry), np.concatenate(all_z)
+                self.ax_line_topo.tricontourf(all_rx, all_ry, all_z, levels=60, cmap=self.cmap_topo, zorder=1)
+
+                if self.show_atoms:
+                    tr = np.repeat(self.atomtypes, self.atomnums)
+                    for t_idx, t_name in enumerate(self.atomtypes):
+                        m = (tr == t_name)
+                        a_rx_all, a_ry_all = [], []
+                        for i_tile in range(-n_tile, n_tile + 1):
+                            for j_tile in range(-n_tile, n_tile + 1):
+                                off = i_tile * self.lv[0, :2] + j_tile * self.lv[1, :2]
+                                a_dx = self.coord[m, 0] + off[0] - self.p1[0]
+                                a_dy = self.coord[m, 1] + off[1] - self.p1[1]
+                                a_rx = a_dx * v_perp[0] + a_dy * v_perp[1]
+                                a_ry = a_dx * v_hat[0] + a_dy * v_hat[1]
+                                vis = (a_rx > -half_w) & (a_rx < half_w) & (a_ry > 0) & (a_ry < p_len)
+                                a_rx_all.append(a_rx[vis])
+                                a_ry_all.append(a_ry[vis])
+                        if a_rx_all:
+                            self.ax_line_topo.scatter(np.concatenate(a_rx_all), np.concatenate(a_ry_all), s=10, color=plt.cm.tab10(t_idx / 10), alpha=0.3, zorder=2)
+
+                self.ax_line_topo.plot([0, 0], [0, p_len], color='red', ls='--', lw=2.0, zorder=6)
+                self.ax_line_topo.scatter([0], [0], c='white', edgecolors='red', s=60, zorder=8)
+                self.ax_line_topo.scatter([0], [p_len], c='white', edgecolors='red', s=60, zorder=8)
+
+                for i, r in enumerate(self.marker_ratios):
+                    color = self.m_colors[i % len(self.m_colors)]
+                    self.ax_line_topo.scatter([0], [r * p_len], c=color, edgecolors='black', s=80, zorder=10)
+
+                self.ax_line_topo.set_xlim(-half_w, half_w)
+                self.ax_line_topo.set_ylim(0, p_len)
+                self.ax_line_topo.set_box_aspect(1)
+                self.ax_line_topo.set_xlabel("Perp. (Å)", fontsize=10)
+                self.ax_line_topo.set_ylabel("Position (Å)", fontsize=10)
+                self.ax_line_topo.set_title("Topo", fontsize=10)
             else:
-                w_ratios = [1, 0.06, 0.05] + [1, 0.0, 0.0] * (num_p - 1) + [1, 0.05, 0.0]
-            lgs = gridspec.GridSpecFromSubplotSpec(1, 3 + num_p * 3, subplot_spec=self.top_gs[1], width_ratios=w_ratios, wspace=0.0)
-
-            # Line Topo panel
-            self.ax_line_topo = self.fig.add_subplot(lgs[0])
-            self.line_decomp_axes.append(self.ax_line_topo)
-
-            ax_spacer = self.fig.add_subplot(lgs[1])
-            ax_spacer.axis('off')
-            self.line_decomp_axes.append(ax_spacer)
-
-            v_line = self.p2 - self.p1
-            v_hat = v_line / p_len
-            v_perp = np.array([-v_hat[1], v_hat[0]])
-            half_w = p_len / 2.0
-
-            n_tile = max(int(self.s_cell.val), 1) + 1
-            margin = p_len * 0.15
-            all_rx, all_ry, all_z = [], [], []
-            for i in range(-n_tile, n_tile + 1):
-                for j in range(-n_tile, n_tile + 1):
-                    off = i * self.lv[0, :2] + j * self.lv[1, :2]
-                    pts = self.grid_xy + off
-                    dx = pts[:, 0] - self.p1[0]
-                    dy = pts[:, 1] - self.p1[1]
-                    rot_x = dx * v_perp[0] + dy * v_perp[1]
-                    rot_y = dx * v_hat[0] + dy * v_hat[1]
-                    mask = (rot_x > -half_w - margin) & (rot_x < half_w + margin) & (rot_y > -margin) & (rot_y < p_len + margin)
-                    all_rx.append(rot_x[mask])
-                    all_ry.append(rot_y[mask])
-                    all_z.append(self.global_z_map[mask])
-            all_rx, all_ry, all_z = np.concatenate(all_rx), np.concatenate(all_ry), np.concatenate(all_z)
-            self.ax_line_topo.tricontourf(all_rx, all_ry, all_z, levels=60, cmap=self.cmap_topo, zorder=1)
-
-            if self.show_atoms:
-                tr = np.repeat(self.atomtypes, self.atomnums)
-                for t_idx, t_name in enumerate(self.atomtypes):
-                    m = (tr == t_name)
-                    a_rx_all, a_ry_all = [], []
-                    for i_tile in range(-n_tile, n_tile + 1):
-                        for j_tile in range(-n_tile, n_tile + 1):
-                            off = i_tile * self.lv[0, :2] + j_tile * self.lv[1, :2]
-                            a_dx = self.coord[m, 0] + off[0] - self.p1[0]
-                            a_dy = self.coord[m, 1] + off[1] - self.p1[1]
-                            a_rx = a_dx * v_perp[0] + a_dy * v_perp[1]
-                            a_ry = a_dx * v_hat[0] + a_dy * v_hat[1]
-                            vis = (a_rx > -half_w) & (a_rx < half_w) & (a_ry > 0) & (a_ry < p_len)
-                            a_rx_all.append(a_rx[vis])
-                            a_ry_all.append(a_ry[vis])
-                    if a_rx_all:
-                        self.ax_line_topo.scatter(np.concatenate(a_rx_all), np.concatenate(a_ry_all), s=10, color=plt.cm.tab10(t_idx / 10), alpha=0.3, zorder=2)
-
-            self.ax_line_topo.plot([0, 0], [0, p_len], color='red', ls='--', lw=2.0, zorder=6)
-            self.ax_line_topo.scatter([0], [0], c='white', edgecolors='red', s=60, zorder=8)
-            self.ax_line_topo.scatter([0], [p_len], c='white', edgecolors='red', s=60, zorder=8)
-
-            for i, r in enumerate(self.marker_ratios):
-                color = self.m_colors[i % len(self.m_colors)]
-                self.ax_line_topo.scatter([0], [r * p_len], c=color, edgecolors='black', s=80, zorder=10)
-
-            self.ax_line_topo.set_xlim(-half_w, half_w)
-            self.ax_line_topo.set_ylim(0, p_len)
-            self.ax_line_topo.set_box_aspect(1)
-            self.ax_line_topo.set_xlabel("Perp. (Å)", fontsize=10)
-            self.ax_line_topo.set_ylabel("Position (Å)", fontsize=10)
-            self.ax_line_topo.set_title("Topo", fontsize=10)
+                self.ax_line_topo = None
 
             # Topo stripe
-            self.ax_stripe = self.fig.add_subplot(lgs[2])
+            self.ax_stripe = self.fig.add_subplot(lgs[stripe_idx])
             self.line_decomp_axes.append(self.ax_stripe)
             lc = LineCollection(
                 np.array([np.array([np.zeros_like(p_dist), p_dist]).T[:-1],
@@ -1507,8 +1721,8 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
             self.ax_prof.set(ylabel="Height (Å)", title="Tip Height", xlabel="Dist (Å)")
 
             for p_idx, (p_label, t_data) in enumerate(processed_partitions):
-                ax_l = self.fig.add_subplot(lgs[3 + p_idx * 3])
-                cax_l = self.fig.add_subplot(lgs[4 + p_idx * 3])
+                ax_l = self.fig.add_subplot(lgs[decomp_base + p_idx * 3])
+                cax_l = self.fig.add_subplot(lgs[decomp_base + 1 + p_idx * 3])
                 self.line_decomp_axes.extend([ax_l, cax_l])
 
                 v_max = np.max(np.abs(t_data)) if self.show_dcmp_norm else global_vmax
@@ -1519,9 +1733,9 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
                     mesh = ax_l.pcolormesh(self.cached_eg, p_dist, t_data, cmap='bwr', shading='auto', vmin=-v_max, vmax=v_max)
                 elif self.show_mag and has_mag:
                     # NCL: |m| is non-negative, use sequential colormap
-                    mesh = ax_l.pcolormesh(self.cached_eg, p_dist, t_data, cmap='hot', shading='auto', vmin=0, vmax=v_max)
+                    mesh = ax_l.pcolormesh(self.cached_eg, p_dist, t_data, cmap='hot', shading='auto', norm=mc.PowerNorm(self.ldos_gamma, vmin=0, vmax=v_max))
                 else:
-                    mesh = ax_l.pcolormesh(self.cached_eg, p_dist, t_data, cmap='jet', shading='auto', vmin=0, vmax=v_max)
+                    mesh = ax_l.pcolormesh(self.cached_eg, p_dist, t_data, cmap='jet', shading='auto', norm=mc.PowerNorm(self.ldos_gamma, vmin=0, vmax=v_max))
 
                 ax_l.set_box_aspect(1)
                 ax_l.set_anchor('W')
@@ -1551,7 +1765,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
                         self.ax_stripe.axhline(y=p_dist[idx], color=color, ls='--', lw=2, alpha=0.7, picker=5, label=f'marker_{i}')
 
             if self.plot_level >= 3:
-                ax_super = self.fig.add_subplot(self.top_gs[1])
+                ax_super = self.fig.add_subplot(self.top_gs[3])
                 ax_super.axis('off')
                 ax_super.set_title(f"LDOS: {self.active_element}", fontsize=12, pad=20)
                 self.line_decomp_axes.append(ax_super)
@@ -1561,8 +1775,8 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
             h_topo = max(1.0, 3.5 - float(num_p))
             self.gs.set_height_ratios([h_topo, float(num_p)])
             self.ax_map_global.set_subplotspec(self.gs[0, 0])
-            self.ax_map.set_subplotspec(self.gs[0, 1])
-            self.ax_spec.set_subplotspec(self.gs[0, 2])
+            self.ax_map.set_subplotspec(self.gs[0, 3])
+            self.ax_spec.set_subplotspec(self.gs[0, 4])
 
             if len(self.map_axes) != nepts * num_p or full_refresh:
                 if getattr(self, 'cax_list', None):
@@ -1624,9 +1838,9 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
                             if use_diverging:
                                 mesh = ax.tricontourf(self.grid_xy[:, 0] + off[0], self.grid_xy[:, 1] + off[1], slice_data, levels=40, cmap='bwr', vmin=-v_max, vmax=v_max)
                             elif self.show_mag and has_mag:
-                                mesh = ax.tricontourf(self.grid_xy[:, 0] + off[0], self.grid_xy[:, 1] + off[1], slice_data, levels=40, cmap='hot', vmin=0, vmax=v_max)
+                                mesh = ax.tricontourf(self.grid_xy[:, 0] + off[0], self.grid_xy[:, 1] + off[1], slice_data, levels=40, cmap='hot', norm=mc.PowerNorm(self.ldos_gamma, vmin=0, vmax=v_max))
                             else:
-                                mesh = ax.tricontourf(self.grid_xy[:, 0] + off[0], self.grid_xy[:, 1] + off[1], slice_data, levels=40, cmap='jet', vmin=0, vmax=v_max)
+                                mesh = ax.tricontourf(self.grid_xy[:, 0] + off[0], self.grid_xy[:, 1] + off[1], slice_data, levels=40, cmap='jet', norm=mc.PowerNorm(self.ldos_gamma, vmin=0, vmax=v_max))
                     ax.scatter(m_coords_np[:, 0], m_coords_np[:, 1], color=self.m_colors[:len(m_coords_np)], s=30, edgecolors='white', zorder=5)
                     title_str = f"E = {target_e:.3f} eV" if p_idx == 0 else ""
                     if self.plot_level >= 3:
@@ -1720,9 +1934,9 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
                     if use_diverging:
                         ax.tricontourf(self.grid_xy[:, 0] + off[0], self.grid_xy[:, 1] + off[1], slice_data, levels=40, cmap='bwr', vmin=-v_max, vmax=v_max)
                     elif self.show_mag and has_mag:
-                        ax.tricontourf(self.grid_xy[:, 0] + off[0], self.grid_xy[:, 1] + off[1], slice_data, levels=40, cmap='hot', vmin=0, vmax=v_max)
+                        ax.tricontourf(self.grid_xy[:, 0] + off[0], self.grid_xy[:, 1] + off[1], slice_data, levels=40, cmap='hot', norm=mc.PowerNorm(self.ldos_gamma, vmin=0, vmax=v_max))
                     else:
-                        ax.tricontourf(self.grid_xy[:, 0] + off[0], self.grid_xy[:, 1] + off[1], slice_data, levels=40, cmap='jet', vmin=0, vmax=v_max)
+                        ax.tricontourf(self.grid_xy[:, 0] + off[0], self.grid_xy[:, 1] + off[1], slice_data, levels=40, cmap='jet', norm=mc.PowerNorm(self.ldos_gamma, vmin=0, vmax=v_max))
             ax.scatter(m_coords_np[:, 0], m_coords_np[:, 1], color=self.m_colors[:len(m_coords_np)], s=30, edgecolors='white', zorder=5)
             title_str = f"E = {target_e:.3f} eV" if p_idx == 0 else ""
             if self.plot_level >= 3:
