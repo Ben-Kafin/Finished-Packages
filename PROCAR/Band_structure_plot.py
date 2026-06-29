@@ -176,7 +176,7 @@ class CPUOrbitalBandPlotter:
                 if not line.startswith('#') and line.strip():
                     p = line.split()
                     current_k.append(float(p[0]))
-                    current_e.append(float(p[1]) - self.fermi_level)
+                    current_e.append(float(p[1]))
             if current_k: band_data.append({'k': np.array(current_k), 'e': np.array(current_e)})
         return band_data
 
