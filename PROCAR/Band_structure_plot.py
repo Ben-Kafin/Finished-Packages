@@ -259,6 +259,60 @@ class CPUOrbitalBandPlotter:
             ax.set_xticks(tick_coords)
             ax.set_xticklabels(tick_labels)
 
+    def _build_state_tensor(self):
+        """Stack self.states into ONE dense array, ONCE, so both color modes are
+        fast array operations and toggling is instant.
+
+        Builds self._state_arr with shape (n_spin, n_bands, max_k, N_ions, 9),
+        indexed to match the draw loops: [s_idx, b_idx, k_idx, ion, lm]. Lookup
+        misses stay zero. Ragged bands are padded to max_k; per-band valid k-count
+        is recorded in self._band_nk so draws only plot real points.
+
+        This is the single heavy step; everything downstream (element sums,
+        orbital s/p/d, per-element population, both modes, every toggle) reads
+        from this tensor with vectorized numpy, never re-walking the dict."""
+        band_raw = self.band_raw
+        n_bands = len(band_raw)
+        self._band_nk = [len(b['k']) for b in band_raw]
+        max_k = max(self._band_nk, default=0)
+
+        # Infer N_ions from any stored state (all share the same first dim).
+        n_ions = 0
+        for v in self.states.values():
+            n_ions = v.shape[0]
+            break
+
+        arr = np.zeros((self.ispin, n_bands, max_k, n_ions, 9), dtype=np.float32)
+        for (s_idx, k_idx, b_idx), mg in self.states.items():
+            if s_idx < self.ispin and b_idx < n_bands and k_idx < max_k:
+                arr[s_idx, b_idx, k_idx] = mg
+        self._state_arr = arr
+        self._n_ions = n_ions
+
+        # Column-group index arrays for s/p/d.
+        self._s_cols = np.array(_L_GROUP_COLS['s'])
+        self._p_cols = np.array(_L_GROUP_COLS['p'])
+        self._d_cols = np.array(_L_GROUP_COLS['d'])
+
+        # Map each element to its 0-based ion indices.
+        self._elem_ion0 = {}
+        for ion_i, elem in self.atom_type_map.items():
+            self._elem_ion0.setdefault(elem, []).append(ion_i - 1)
+
+    def _elem_spd(self, elem):
+        """Vectorized per-element s/p/d magnitudes from the state tensor.
+        Returns array (n_spin, n_bands, max_k, 3) = (s_sum, p_sum, d_sum) summed
+        over that element's ions. Pure array ops; no Python per-point loop."""
+        ions0 = self._elem_ion0.get(elem, [])
+        if not ions0:
+            sh = self._state_arr.shape
+            return np.zeros((sh[0], sh[1], sh[2], 3), dtype=np.float64)
+        sub = self._state_arr[:, :, :, ions0, :]            # (S,B,K,n_e_ions,9)
+        s = sub[..., self._s_cols].sum(axis=(3, 4))         # (S,B,K)
+        p = sub[..., self._p_cols].sum(axis=(3, 4))
+        d = sub[..., self._d_cols].sum(axis=(3, 4))
+        return np.stack([s, p, d], axis=-1)                 # (S,B,K,3)
+
     def plot_colored_bands(self):
         """Build the interactive figure with an 'Orbital' toggle (bottom left).
 
@@ -266,8 +320,10 @@ class CPUOrbitalBandPlotter:
         input filter_types (None slots skip a channel).
         Toggle ON: one subplot per element NAMED IN filter_types (None slots
         skipped); coloring switches to orbital (hue = s/p/d blend, visibility =
-        total population). Clicking rebuilds the figure live."""
+        total population). Both modes read one precomputed state tensor, so
+        clicking the toggle is instant."""
         self.band_raw = self.parse_band_dat()
+        self._build_state_tensor()   # single heavy step; both modes read this
         self.fig = plt.figure(figsize=(12, 8))
         # 'Orbital' toggle, bottom left.
         self._ax_toggle = self.fig.add_axes([0.01, 0.01, 0.12, 0.06])
@@ -286,7 +342,6 @@ class CPUOrbitalBandPlotter:
     def _rebuild_figure(self):
         """Clear and redraw the figure body for the current mode, preserving the
         toggle widget axes."""
-        # Remove every axis except the toggle.
         for ax in list(self.fig.axes):
             if ax is not self._ax_toggle:
                 self.fig.delaxes(ax)
@@ -299,40 +354,39 @@ class CPUOrbitalBandPlotter:
         """Single-panel coloring: each band point's RGB is the normalized
         composition of the named elements (0=R, 1=G, 2=B). None/falsy filter
         slots leave their channel empty. Works for any number of ions/elements,
-        including one. Per-ion weight is the sum over all 9 lm columns (= the
-        total-charge 'tot' for that ion)."""
-        band_raw = self.band_raw
+        including one. Per-element weight is the total charge on that element
+        (sum of all 9 lm columns over its ions), computed by vectorized array ops
+        from the state tensor. One scatter call per band."""
         ax = self.fig.add_subplot(1, 1, 1)
 
+        # Per-element total population: sum s/p/d -> (S,B,K) for each filter element.
+        active = [t for t in self.filter_types if t]
+        # weights[channel] is (S,B,K); channel order follows filter_types (None -> 0).
+        chan_weight = []
+        for t in self.filter_types:
+            if t:
+                spd = self._elem_spd(t)          # (S,B,K,3)
+                chan_weight.append(spd.sum(axis=-1))  # (S,B,K) total charge on element
+            else:
+                chan_weight.append(None)
+
+        # Stack the up-to-3 channels into an RGB weight array.
+        S, B, K = self._state_arr.shape[0], self._state_arr.shape[1], self._state_arr.shape[2]
+        rgbw = np.zeros((S, B, K, 3), dtype=np.float64)
+        for ci in range(min(3, len(self.filter_types))):
+            if chan_weight[ci] is not None:
+                rgbw[..., ci] = chan_weight[ci]
+        w_total = rgbw.sum(axis=-1)                # (S,B,K)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            rgb = np.where(w_total[..., None] > 0, rgbw / w_total[..., None], 0.0)
+        # Points with zero total -> black (matches original [0,0,0,1]).
+
         for s_idx in range(self.ispin):
-            for b_idx, band in enumerate(band_raw):
+            for b_idx, band in enumerate(self.band_raw):
+                nk = self._band_nk[b_idx]
                 k_coords, e_coords = band['k'], band['e']
-                colors = []
-
-                for k_idx in range(len(k_coords)):
-                    mags = self.states.get((s_idx, k_idx, b_idx), None)
-
-                    # Named (non-None) filter slots only; None slots leave their channel empty.
-                    active_types = [t for t in self.filter_types if t]
-                    type_weights = {t: 0.0 for t in active_types}
-                    if mags is not None:
-                        for ion_i, elem in self.atom_type_map.items():
-                            if elem in type_weights:
-                                # Sum the 9 lm columns -> per-ion total charge.
-                                type_weights[elem] += float(mags[ion_i-1].sum())
-
-                    # Per-position weights; a None/falsy slot contributes 0 to its channel.
-                    weights = [type_weights[t] if t else 0.0 for t in self.filter_types]
-                    w_total = sum(weights)
-
-                    if w_total > 0:
-                        r = weights[0] / w_total
-                        g = weights[1] / w_total if len(weights) > 1 else 0.0
-                        b = weights[2] / w_total if len(weights) > 2 else 0.0
-                        colors.append([r, g, b, 1.0])
-                    else:
-                        colors.append([0.0, 0.0, 0.0, 1.0])
-
+                colors = np.ones((nk, 4), dtype=np.float64)   # alpha 1
+                colors[:, :3] = rgb[s_idx, b_idx, :nk, :]
                 ax.scatter(k_coords, e_coords, c=colors, s=15, edgecolors='none', zorder=2)
 
         base_colors = [[1,0,0], [0,1,0], [0,0,1]]
@@ -349,14 +403,10 @@ class CPUOrbitalBandPlotter:
     def _draw_orbital_mode(self):
         """One subplot per element NAMED IN filter_types (None slots skipped).
         Within each element's panel, HUE = the s/p/d orbital blend (s=R, p=G,
-        d=B, normalized like element mode) summed over that element's ions, and
-        VISIBILITY = the element's total population at that point (high
-        population -> vivid hue; low population -> washed toward transparent,
-        self-scaled per element). Works for any number of ions/elements."""
-        band_raw = self.band_raw
-
-        # Elements to show = the named (non-None) filter slots, in input order,
-        # de-duplicated. Orbital mode shows ONLY the filtered elements.
+        d=B, normalized like element mode), and VISIBILITY (alpha) = the element's
+        total population at that point, self-scaled per element. Vectorized array
+        ops from the state tensor; one scatter call per band."""
+        # Elements to show = named (non-None) filter slots, de-duplicated, input order.
         elements = []
         for t in self.filter_types:
             if t and t not in elements:
@@ -368,56 +418,27 @@ class CPUOrbitalBandPlotter:
             return
 
         n_el = len(elements)
-
-        # Per-element max total population, for self-scaled visibility/alpha.
-        el_max_pop = {e: 1e-30 for e in elements}
-        for s_idx in range(self.ispin):
-            for b_idx, band in enumerate(band_raw):
-                for k_idx in range(len(band['k'])):
-                    mags = self.states.get((s_idx, k_idx, b_idx), None)
-                    if mags is None:
-                        continue
-                    for ion_i, elem in self.atom_type_map.items():
-                        if elem in el_max_pop:
-                            pop = float(mags[ion_i-1].sum())
-                            if pop > el_max_pop[elem]:
-                                el_max_pop[elem] = pop
-
         for ax_idx, elem in enumerate(elements):
             ax = self.fig.add_subplot(1, n_el, ax_idx + 1)
-            ion_indices = [ion_i for ion_i, e in self.atom_type_map.items() if e == elem]
+            spd = self._elem_spd(elem)                # (S,B,K,3)
+            pop = spd.sum(axis=-1)                     # (S,B,K) element total population
+            max_pop = float(pop.max()) if pop.size else 0.0
+            if max_pop <= 0:
+                max_pop = 1e-30
+            with np.errstate(divide='ignore', invalid='ignore'):
+                hue = np.where(pop[..., None] > 0, spd / pop[..., None], 0.0)  # (S,B,K,3)
+            alpha = np.minimum(1.0, pop / max_pop)    # (S,B,K)
 
             for s_idx in range(self.ispin):
-                for b_idx, band in enumerate(band_raw):
+                for b_idx, band in enumerate(self.band_raw):
+                    nk = self._band_nk[b_idx]
                     k_coords, e_coords = band['k'], band['e']
-                    colors = []
-                    for k_idx in range(len(k_coords)):
-                        mags = self.states.get((s_idx, k_idx, b_idx), None)
-                        if mags is None:
-                            colors.append([1.0, 1.0, 1.0, 0.0])
-                            continue
-
-                        # Sum this element's ions over the s/p/d column groups.
-                        spd = np.zeros(3, dtype=np.float64)
-                        for ci, orb in enumerate(_ORBITAL_ORDER):
-                            cols = _L_GROUP_COLS[orb]
-                            for ion_i in ion_indices:
-                                spd[ci] += float(mags[ion_i-1][cols].sum())
-
-                        pop = float(spd.sum())  # element total population at this point
-                        if pop > 0:
-                            # Hue = normalized s/p/d blend (same logic as element RGB).
-                            r, g, b = spd / pop
-                            # Visibility: high population -> vivid (alpha->1);
-                            # low population -> faint. Self-scaled per element.
-                            alpha = min(1.0, pop / el_max_pop[elem])
-                            colors.append([r, g, b, alpha])
-                        else:
-                            colors.append([1.0, 1.0, 1.0, 0.0])
-
+                    colors = np.empty((nk, 4), dtype=np.float64)
+                    colors[:, :3] = hue[s_idx, b_idx, :nk, :]
+                    colors[:, 3] = alpha[s_idx, b_idx, :nk]
+                    # Points with zero population -> alpha 0 (invisible), matching original.
                     ax.scatter(k_coords, e_coords, c=colors, s=15, edgecolors='none', zorder=2)
 
-            # Per-panel orbital legend (s=R, p=G, d=B).
             orb_colors = [[1,0,0], [0,1,0], [0,0,1]]
             legend_elements = [Line2D([0], [0], marker='o', color='w', label=orb,
                               markerfacecolor=c, markersize=10)
