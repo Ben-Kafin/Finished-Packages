@@ -19,8 +19,8 @@ import re
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
-from matplotlib.widgets import CheckButtons
-from collections import defaultdict
+#from matplotlib.widgets import CheckButtons
+#from collections import defaultdict
 from enum import Enum, auto
 
 
@@ -59,7 +59,7 @@ class CPUOrbitalBandPlotter:
         self.fermi_level = self.parse_doscar(directory)
         self.atom_type_map = self.parse_poscar()
 
-        print(f"--- Initialization Complete ---")
+        print("--- Initialization Complete ---")
         print(f"Fermi Level (from DOSCAR): {self.fermi_level:.4f} eV")
         print(f"Detected Spin Mode: {self.spin_mode.name if self.spin_mode is not None else 'UNKNOWN'}")
         print(f"POSCAR Mapping: {len(self.atom_type_map)} ions found")
@@ -116,7 +116,7 @@ class CPUOrbitalBandPlotter:
     def parse_procar(self):
         """Zero-indexed Magnitude parsing. Skips LORBIT=14 phase blocks."""
         if not os.path.exists(self.procar_path): return
-        print(f"\n>>> Starting Zero-Based PROCAR Parsing...")
+        print("\n>>> Starting Zero-Based PROCAR Parsing...")
 
         with open(self.procar_path, "r") as f:
             content = f.read()
@@ -148,15 +148,13 @@ class CPUOrbitalBandPlotter:
                     i += 1
 
                     mags = np.zeros(N_atoms, dtype=np.float32)
-                    while i < len(lines):
-                        ln = lines[i].strip()
-                        if not ln or ln.lower().startswith("tot"):
-                            while i < len(lines) and not (re.search(r"band\s+\d+", lines[i], re.I) or
-                                                          re.search(r"k[- ]?point", lines[i], re.I)):
-                                i += 1
-                            break
-                        tokens = ln.split()
+                    while i < len(lines) and not lines[i].strip().lower().startswith("tot"):
+                        tokens = lines[i].strip().split()
                         mags[int(tokens[0])-1] = float(tokens[-1])
+                        i += 1
+
+                    while i < len(lines) and not (re.search(r"band\s+\d+", lines[i], re.I) or
+                                                  re.search(r"k[- ]?point", lines[i], re.I)):
                         i += 1
 
                     self.states[(s_idx, k_idx, b_idx)] = mags
@@ -180,36 +178,9 @@ class CPUOrbitalBandPlotter:
             if current_k: band_data.append({'k': np.array(current_k), 'e': np.array(current_e)})
         return band_data
 
-    def parse_klabels(self):
-        """Parse the VASPKIT KLABELS file into (tick_coords, tick_labels).
-
-        Logic matches the working unfold_bands.py reader: skip empty lines and
-        any line containing 'K-Label' or '*'; take the first token as the label
-        and the second as the coordinate; convert GAMMA -> $\\Gamma$. If the file
-        is absent or unreadable, returns empty lists so the plot keeps normal
-        numeric x-axis ticks."""
-        tick_coords, tick_labels = [], []
-        if not os.path.exists(self.klabels_path):
-            return tick_coords, tick_labels
-        with open(self.klabels_path, 'r') as f:
-            for line in f:
-                parts = line.split()
-                if not parts or 'K-Label' in line or '*' in line:
-                    continue
-                try:
-                    label = parts[0]
-                    coord = float(parts[1])
-                    if label.upper() == 'GAMMA':
-                        label = r'$\Gamma$'
-                    tick_labels.append(label)
-                    tick_coords.append(coord)
-                except (ValueError, IndexError):
-                    continue
-        return tick_coords, tick_labels
-
     def plot_colored_bands(self):
         """Renders scatter points with full hue normalization for ANY provided elements."""
-        print(f"\nGenerating Generic Normalized Band Plot...")
+        print("\nGenerating Generic Normalized Band Plot...")
         band_raw = self.parse_band_dat()
         fig, ax = plt.subplots(figsize=(12, 8))
         if self.ispin == 2: plt.subplots_adjust(right=0.85)
@@ -253,15 +224,6 @@ class CPUOrbitalBandPlotter:
                           markerfacecolor=c, markersize=10)
                           for e, c in zip(self.filter_types, base_colors) if e]
         ax.legend(handles=legend_elements, title="Atomic Projections", loc='upper right')
-
-        # High-symmetry k-point ticks from KLABELS (grey guide lines + labels).
-        # Absent/empty KLABELS leaves the default numeric x-axis untouched.
-        tick_coords, tick_labels = self.parse_klabels()
-        if tick_coords:
-            for coord in tick_coords:
-                ax.axvline(x=coord, color='gray', linestyle='--', linewidth=0.8, alpha=0.5)
-            ax.set_xticks(tick_coords)
-            ax.set_xticklabels(tick_labels)
 
         ax.axhline(0, color='red', ls='-', lw=0.8, alpha=0.5)
         ax.set_ylim(-3, 3); ax.set_ylabel('Energy (eV)')
