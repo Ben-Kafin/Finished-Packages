@@ -115,9 +115,41 @@ class Unified_STM_Simulator:
                 coord = np.dot(coord, lv)
         return lv, coord, atomtypes, atomnums
 
+    def _unwrap_z_vacuum(self, coord):
+        """Place every atom on the slab side of the vacuum gap in z.
+
+        z is the surface-normal direction and is NOT periodic for a slab: an atom
+        whose fractional z has wrapped through the cell boundary appears at the top
+        of the cell (in the vacuum above the slab) when it physically belongs below
+        the slab bottom. Such phantom atoms corrupt the vacuum LDOS as the tip is
+        raised. This detects the vacuum as the largest gap in the circular
+        fractional-z distribution (definitionally the vacuum in a slab cell) and
+        shifts any atom above the gap's midpoint down by one c-vector so the slab is
+        contiguous with no atom in the top vacuum. System-independent: no hardcoded
+        thresholds, and a no-op when no atom has wrapped.
+        """
+        inv_lv = inv(self.lv)
+        frac = np.dot(coord, inv_lv)
+        fz = frac[:, 2] % 1.0
+        n = len(fz)
+        order = np.argsort(fz)
+        fz_sorted = fz[order]
+        gaps = np.empty(n)
+        gaps[:-1] = np.diff(fz_sorted)
+        gaps[-1] = (fz_sorted[0] + 1.0) - fz_sorted[-1]   # circular wrap-around gap
+        vac_i = int(np.argmax(gaps))
+        low_edge = fz_sorted[vac_i]
+        high_edge = fz_sorted[(vac_i + 1) % n] + (1.0 if vac_i == n - 1 else 0.0)
+        cut = ((low_edge + high_edge) / 2.0) % 1.0
+        fz_unwrapped = fz.copy()
+        fz_unwrapped[fz_unwrapped > cut] -= 1.0
+        frac[:, 2] = fz_unwrapped
+        return np.dot(frac, self.lv)
+
     def parse_vasp_outputs(self, locpot_path):
         poscar_path = './CONTCAR' if exists('./CONTCAR') and getsize('./CONTCAR') > 0 else './POSCAR'
         self.lv, self.coord, self.atomtypes, self.atomnums = self._parse_poscar(poscar_path)
+        self.coord = self._unwrap_z_vacuum(self.coord)
 
         # --- DOSCAR: auto-detects spin mode ---
         dos_parser = SpinAwareDosParser(join(self.filepath, 'DOSCAR'))
@@ -536,7 +568,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
         self.cached_marker_coords, self.cached_spec_ldos = None, None
 
         # --- Path mode state ---
-        self.path_atoms = None            # initial seed: list of 1-based index lists [[154],[223],...]
+        self.path = None                  # initial seed: all atom-index lists [[154],...] OR all [x,y] coords; no mix
         self.path_extend = False          # toggle: extend ends to first local cell wall
         self.path_nodes = None            # live list of N draggable [x, y] node positions
         self.cached_path_nodes = None     # cache-invalidation key for path topo
@@ -548,7 +580,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
                         ldos_bias_sign='neg', use_decay_topo=True, use_decay_ldos=True,
                         show_decay_toggle=True,
                         line_endpoints=None, marker_positions=None, extra_broadening=None,
-                        use_angular=False, path_atoms=None, path_extend=False):
+                        use_angular=False, path=None, path_extend=False):
         self.ldos_bias_sign = ldos_bias_sign
         self.use_decay_topo, self.use_decay_ldos = use_decay_topo, use_decay_ldos
         self.show_decay_toggle = bool(show_decay_toggle)
@@ -571,9 +603,20 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
 
         # --- Path mode seeding ---
         self.path_extend = path_extend
-        if path_atoms is not None:
-            self.path_atoms = path_atoms
-            self.path_nodes = [self.coord[i[0] - 1, :2].astype(float).copy() for i in path_atoms]
+        if path is not None:
+            self.path = path
+            lengths = {len(p) for p in path}
+            if lengths == {1}:
+                # Atom numbers (1-based): look up each atom's xy from self.coord
+                self.path_nodes = [self.coord[p[0] - 1, :2].astype(float).copy() for p in path]
+            elif lengths == {2}:
+                # Cartesian [x, y] coordinates: use directly
+                self.path_nodes = [np.asarray(p, dtype=float).copy() for p in path]
+            else:
+                raise ValueError(
+                    "path must be either all atom-number elements like [[154],[223],...] "
+                    "or all coordinate elements like [[x,y],[x,y],...] — not mixed."
+                )
         elif self.path_nodes is None:
             # Default 3-node path so Path mode is usable even if no seed supplied
             self.path_nodes = [np.array([0.0, 0.0]),
