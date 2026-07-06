@@ -21,7 +21,6 @@ import matplotlib.colors as mc, colorsys
 from matplotlib.lines import Line2D
 import mplcursors
 from time import time
-import hashlib
 
 from .doscar_parser import SpinAwareDosParser, SpinMode
 from .locpot_manager import LocpotManager
@@ -300,11 +299,6 @@ class Unified_STM_Simulator:
             return ""
         return "_broad_" + "_".join(f"{t}{s:.3f}" for t, s in active)
 
-    def _angular_cache_suffix(self):
-        # Angular-mode results carry their own cache tag so they never mix with
-        # isotropic results or with each other across kernel revisions.
-        return "_ang3" if getattr(self, 'use_angular', False) else ""
-
     def _unit_cell_cache_suffix(self):
         # Periodic-image count affects every sf sum. Embed in cache filename so old caches
         # auto-invalidate when unit_cell_num changes.
@@ -313,31 +307,6 @@ class Unified_STM_Simulator:
     def _decay_cache_suffix(self):
         # Converged topographies depend on the decay model used to produce them.
         return "" if getattr(self, 'use_decay_topo', True) else "_nodecay"
-
-    def _get_angular_azimuthal(self, wrapped_tip_pos_gpu):
-        """Azimuthal factors of the orbital angular densities, one per tip-image pair.
-
-        These depend only on the in-plane tip layout and the periodic atom
-        positions, not on z. During constant-current convergence only z changes,
-        so the four arrays are computed once per tip layout and served from a
-        cache on every subsequent call with the same layout.
-        """
-        xy_key = hashlib.blake2b(cp.asnumpy(wrapped_tip_pos_gpu[:, :2]).tobytes(),
-                                 digest_size=16).hexdigest()
-        cache = getattr(self, '_azim_cache', None)
-        if cache is not None and cache['key'] == xy_key:
-            return cache['arrays']
-        delta_xy = wrapped_tip_pos_gpu[None, :, :2] - self.periodic_coord_gpu[:, None, :2]
-        phi = cp.arctan2(delta_xy[..., 1], delta_xy[..., 0])
-        cos_phi = cp.cos(phi)
-        sin_phi = cp.sin(phi)
-        sin2_phi = (sin_phi * sin_phi).astype(cp.float32)
-        cos2_phi = (cos_phi * cos_phi).astype(cp.float32)
-        sin2_2phi = (4.0 * sin2_phi * cos2_phi).astype(cp.float32)
-        cos2_2phi = ((2.0 * cos2_phi - 1.0) ** 2).astype(cp.float32)
-        arrays = (sin2_phi, cos2_phi, sin2_2phi, cos2_2phi)
-        self._azim_cache = {'key': xy_key, 'arrays': arrays}
-        return arrays
 
     def _calculate_ldos_at_points_gpu(self, tip_positions, emin, emax,
                                       use_energy_decay=False, preserve_orbitals=False,
@@ -362,108 +331,34 @@ class Unified_STM_Simulator:
 
         def _compute_channel(pot, dos_gpu, dos_collapsed):
             phi_local = cp_ndimage.map_coordinates(pot, grid_indices, order=1, mode='wrap') - self.ef
-            if self.use_angular:
-                # Tersoff-Hamann point-LDOS reconstruction: each atom's
-                # lm-projected DOSCAR population is placed into the vacuum with
-                # the angular density 4*pi*|Y_lm|^2 of the orthonormal real
-                # spherical harmonic it was projected onto (LORBIT=14 basis;
-                # Schueler et al., JPCM 30, 475901 (2018), Eqs. (4)-(12)),
-                # weighted by the tunneling decay of the same tip-image pair.
-                # VASP lm column order: s, py, pz, px, dxy, dyz, dz2, dxz, dx2-y2.
-                # Every channel angle-averages to 1, so the isotropic average of
-                # this mode equals the plain PDOS sum of the toggle-off path.
-                # Each factor splits into a polar part (z-dependent, built from
-                # the same distances the decay uses) and an azimuthal part
-                # (z-independent, served from the per-layout cache).
-                sin2_phi, cos2_phi, sin2_2phi, cos2_2phi = self._get_angular_azimuthal(wrapped_tip_pos_gpu)
-                dz = wrapped_tip_pos_gpu[None, :, 2] - self.periodic_coord_gpu[:, None, 2]
-                inv_d = 1.0 / cp.maximum(dists, 1e-30)
-                cos2_theta = (dz * inv_d) ** 2
-                sin2_theta = cp.maximum(0.0, 1.0 - cos2_theta)
-                sin4_theta = sin2_theta * sin2_theta
-                sin2_2theta = 4.0 * sin2_theta * cos2_theta
-                dz2_polar = (3.0 * cos2_theta - 1.0) ** 2
-
-                # chan[b, p, t] = 4*pi*|Y_b|^2 at the angle from periodic image p to tip t.
-                chan = cp.empty((9,) + dists.shape, dtype=cp.float32)
-                chan[0] = 1.0                                   # s
-                chan[1] = 3.0 * sin2_theta * sin2_phi           # py
-                chan[2] = 3.0 * cos2_theta                      # pz
-                chan[3] = 3.0 * sin2_theta * cos2_phi           # px
-                chan[4] = 3.75 * sin4_theta * sin2_2phi         # dxy    (15/4)
-                chan[5] = 3.75 * sin2_2theta * sin2_phi         # dyz    (15/4)
-                chan[6] = 1.25 * dz2_polar                      # dz2    (5/4)(3cos2t-1)^2
-                chan[7] = 3.75 * sin2_2theta * cos2_phi         # dxz    (15/4)
-                chan[8] = 3.75 * sin4_theta * cos2_2phi         # dx2-y2 (15/4)
-
-                if not preserve_orbitals:
-                    # Orbital channel folded into the same contraction axis as the
-                    # periodic images: q = (b, p), so the kernel is the identical
-                    # GEMM/GEMV the isotropic path runs, with a 9x longer axis.
-                    dos_q = dos_gpu[self.atom_indices_periodic_gpu][:, energy_indices, :]
-                    dos_q = cp.ascontiguousarray(dos_q.transpose(2, 0, 1).reshape(-1, num_e))
-                    if use_energy_decay:
-                        bias_v = cp.asarray(global_bias if global_bias is not None else (emax - emin), dtype=cp.float32)
-                        K_all = gpu_chen_tunneling_factor(bias_v, calc_energies_gpu[:, None], phi_local)
-                        output_ldos = cp.zeros((num_pts, num_e), dtype=cp.float32)
-                        for e_idx in range(num_e):
-                            sf = cp.exp(-1.0 * dists * K_all[e_idx][None, :] * 1e-10)
-                            W = (chan * sf[None, :, :]).reshape(-1, num_pts)
-                            output_ldos[:, e_idx] = cp.dot(W.T, dos_q[:, e_idx])
-                    else:
-                        kappa = 0.512 * cp.sqrt(cp.maximum(0.1, phi_local))
-                        sf = cp.exp(-2.0 * kappa[None, :] * dists)
-                        W = (chan * sf[None, :, :]).reshape(-1, num_pts)
-                        output_ldos = cp.dot(W.T, dos_q)
+            if not preserve_orbitals:
+                output_ldos = cp.zeros((num_pts, num_e), dtype=cp.float32)
+                dos_periodic = dos_collapsed[self.atom_indices_periodic_gpu, :]
+                dos_active = dos_periodic[:, energy_indices]
+                if use_energy_decay:
+                    bias_v = cp.asarray(global_bias if global_bias is not None else (emax - emin), dtype=cp.float32)
+                    K_all = gpu_chen_tunneling_factor(bias_v, calc_energies_gpu[:, None], phi_local)
+                    for e_idx in range(num_e):
+                        sf = cp.exp(-1.0 * dists * K_all[e_idx][None, :] * 1e-10)
+                        output_ldos[:, e_idx] = cp.dot(sf.T, dos_active[:, e_idx])
                 else:
-                    # Atom- and orbital-resolved output: collapse images onto base
-                    # atoms with one batched matmul over the 9 channels, then
-                    # broadcast against the per-atom orbital DOS.
-                    dos_active = dos_gpu[:, energy_indices, :]
-                    if use_energy_decay:
-                        bias_v = cp.asarray(global_bias if global_bias is not None else (emax - emin), dtype=cp.float32)
-                        K_all = gpu_chen_tunneling_factor(bias_v, calc_energies_gpu[:, None], phi_local)
-                        output_ldos = cp.zeros((num_pts, num_e, self.num_total_atoms, dos_gpu.shape[2]), dtype=cp.float32)
-                        for e_idx in range(num_e):
-                            sf = cp.exp(-1.0 * dists * K_all[e_idx][None, :] * 1e-10)
-                            w_orb = cp.matmul(self.map_mat_gpu[None, :, :], chan * sf[None, :, :])
-                            output_ldos[:, e_idx, :, :] = (w_orb.transpose(2, 1, 0)
-                                                           * dos_active[:, e_idx, :][None, :, :])
-                    else:
-                        kappa = 0.512 * cp.sqrt(cp.maximum(0.1, phi_local))
-                        sf = cp.exp(-2.0 * kappa[None, :] * dists)
-                        w_orb = cp.matmul(self.map_mat_gpu[None, :, :], chan * sf[None, :, :])
-                        output_ldos = (w_orb.transpose(2, 1, 0)[:, None, :, :]
-                                       * dos_active.transpose(1, 0, 2)[None, :, :, :])
+                    kappa = 0.512 * cp.sqrt(cp.maximum(0.1, phi_local))
+                    sf = cp.exp(-2.0 * kappa[None, :] * dists)
+                    output_ldos = cp.dot(sf.T, dos_active)
             else:
-                if not preserve_orbitals:
-                    output_ldos = cp.zeros((num_pts, num_e), dtype=cp.float32)
-                    dos_periodic = dos_collapsed[self.atom_indices_periodic_gpu, :]
-                    dos_active = dos_periodic[:, energy_indices]
-                    if use_energy_decay:
-                        bias_v = cp.asarray(global_bias if global_bias is not None else (emax - emin), dtype=cp.float32)
-                        K_all = gpu_chen_tunneling_factor(bias_v, calc_energies_gpu[:, None], phi_local)
-                        for e_idx in range(num_e):
-                            sf = cp.exp(-1.0 * dists * K_all[e_idx][None, :] * 1e-10)
-                            output_ldos[:, e_idx] = cp.dot(sf.T, dos_active[:, e_idx])
-                    else:
-                        kappa = 0.512 * cp.sqrt(cp.maximum(0.1, phi_local))
-                        sf = cp.exp(-2.0 * kappa[None, :] * dists)
-                        output_ldos = cp.dot(sf.T, dos_active)
-                else:
-                    output_ldos = cp.zeros((num_pts, num_e, self.num_total_atoms, dos_gpu.shape[2]), dtype=cp.float32)
-                    if use_energy_decay:
-                        bias_v = cp.asarray(global_bias if global_bias is not None else (emax - emin), dtype=cp.float32)
-                        K_all = gpu_chen_tunneling_factor(bias_v, calc_energies_gpu[:, None], phi_local)
-                        for e_idx in range(num_e):
-                            sf = cp.exp(-1.0 * dists * K_all[e_idx][None, :] * 1e-10)
-                            w_atom = cp.dot(self.map_mat_gpu, sf)
-                            output_ldos[:, e_idx, :, :] = w_atom.T[:, :, None] * dos_gpu[:, energy_indices[e_idx], :][None, :, :]
-                    else:
-                        kappa = 0.512 * cp.sqrt(cp.maximum(0.1, phi_local))
-                        sf = cp.exp(-2.0 * kappa[None, :] * dists)
+                output_ldos = cp.zeros((num_pts, num_e, self.num_total_atoms, dos_gpu.shape[2]), dtype=cp.float32)
+                if use_energy_decay:
+                    bias_v = cp.asarray(global_bias if global_bias is not None else (emax - emin), dtype=cp.float32)
+                    K_all = gpu_chen_tunneling_factor(bias_v, calc_energies_gpu[:, None], phi_local)
+                    for e_idx in range(num_e):
+                        sf = cp.exp(-1.0 * dists * K_all[e_idx][None, :] * 1e-10)
                         w_atom = cp.dot(self.map_mat_gpu, sf)
-                        output_ldos = w_atom.T[:, None, :, None] * dos_gpu[:, energy_indices, :].transpose(1, 0, 2)[None, :, :, :]
+                        output_ldos[:, e_idx, :, :] = w_atom.T[:, :, None] * dos_gpu[:, energy_indices[e_idx], :][None, :, :]
+                else:
+                    kappa = 0.512 * cp.sqrt(cp.maximum(0.1, phi_local))
+                    sf = cp.exp(-2.0 * kappa[None, :] * dists)
+                    w_atom = cp.dot(self.map_mat_gpu, sf)
+                    output_ldos = w_atom.T[:, None, :, None] * dos_gpu[:, energy_indices, :].transpose(1, 0, 2)[None, :, :, :]
             return output_ldos
 
         # All modes use total potential for the barrier
@@ -542,7 +437,6 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
         # logic it controlled is retained throughout the display code and
         # hard-set off here. Restore a control for this flag to re-enable it.
         self.show_dcmp_norm = False
-        self.use_angular = False
         # PowerNorm gamma for all LDOS heatmaps (1.0 = linear; <1 squashes the
         # colormap toward the minimum). Live-controlled by the bottom-row slider.
         self.ldos_gamma = 1.0
@@ -580,11 +474,10 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
                         ldos_bias_sign='neg', use_decay_topo=True, use_decay_ldos=True,
                         show_decay_toggle=True,
                         line_endpoints=None, marker_positions=None, extra_broadening=None,
-                        use_angular=False, path=None, path_extend=False):
+                        path=None, path_extend=False):
         self.ldos_bias_sign = ldos_bias_sign
         self.use_decay_topo, self.use_decay_ldos = use_decay_topo, use_decay_ldos
         self.show_decay_toggle = bool(show_decay_toggle)
-        self.use_angular = use_angular
         if line_endpoints is not None:
             self.p1, self.p2 = np.array(line_endpoints[0], dtype=float), np.array(line_endpoints[1], dtype=float)
         elif self.p1 is None:
@@ -640,7 +533,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
         grid_xy_gpu = cp.array(grid_xy, dtype=cp.float32)
         z_fixed = cp.full(grid_xy_gpu.shape[0], self.z_highest_atom + topo_height, dtype=cp.float32)
         t_emin, t_emax = sorted([0.0, topo_bias])
-        cache_name = f"global_topo_{topo_bias}V_{topo_height}A_{grid_res}px{self._broadening_cache_suffix()}{self._angular_cache_suffix()}{self._unit_cell_cache_suffix()}{self._decay_cache_suffix()}.npy"
+        cache_name = f"global_topo_{topo_bias}V_{topo_height}A_{grid_res}px{self._broadening_cache_suffix()}{self._unit_cell_cache_suffix()}{self._decay_cache_suffix()}.npy"
         if exists(cache_name):
             print(f"[*] Loading Cached Global Topography: {cache_name}")
             self.current_z_map = np.load(cache_name)
@@ -975,8 +868,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
         # CheckButtons construction and the click handler both iterate this list.
         toggle_defs = [('Atoms', 'show_atoms'), ('Decay', 'use_decay_ldos'),
                        ('Norm', 'normalize'), ('Mag', 'show_mag'),
-                       ('Cell', 'show_unit_cell'), ('Angular', 'use_angular'),
-                       ('Extend', 'path_extend')]
+                       ('Cell', 'show_unit_cell'), ('Extend', 'path_extend')]
         if not getattr(self, 'show_decay_toggle', True):
             toggle_defs = [d for d in toggle_defs if d[0] != 'Decay']
         self._toggle_defs = toggle_defs
@@ -1159,7 +1051,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
     def _recompute_global_topo(self):
         """Re-run Phase 1 global topography with current broadened DOS (cache-aware)."""
         grid_res = int(np.sqrt(len(self.grid_xy)))
-        cache_name = f"global_topo_{self.global_topo_bias}V_{self.topo_height}A_{grid_res}px{self._broadening_cache_suffix()}{self._angular_cache_suffix()}{self._unit_cell_cache_suffix()}{self._decay_cache_suffix()}.npy"
+        cache_name = f"global_topo_{self.global_topo_bias}V_{self.topo_height}A_{grid_res}px{self._broadening_cache_suffix()}{self._unit_cell_cache_suffix()}{self._decay_cache_suffix()}.npy"
         if exists(cache_name):
             print(f"[*] Loading Cached Global Topography: {cache_name}")
             self.current_z_map = np.load(cache_name)
@@ -1232,18 +1124,22 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
             self._update_all(full_refresh=True)
 
     def _on_ui_change(self, val):
-        prev_use_angular = self.use_angular
+        prev_decay = self.use_decay_ldos
         prev_path_extend = self.path_extend
         states = self.chk.get_status()
         for (label, attr), state in zip(self._toggle_defs, states):
             setattr(self, attr, state)
+        # The Decay checkbox drives every decay-dependent evaluation in every
+        # mode: lock the topo flag to the LDOS flag so the convergence engines
+        # and the final curves always share one decay model.
+        self.use_decay_topo = self.use_decay_ldos
         self.display_cells = int(self.s_cell.val)
         if hasattr(self, 's_ldos_gamma'):
             self.ldos_gamma = float(self.s_ldos_gamma.val)
         self._sync_textboxes()
 
-        # Angular toggle OR path-extend toggle: invalidate caches and recompute.
-        if (self.use_angular != prev_use_angular) or (self.path_extend != prev_path_extend):
+        # Decay toggle OR path-extend toggle: invalidate caches and recompute.
+        if (self.use_decay_ldos != prev_decay) or (self.path_extend != prev_path_extend):
             self.cached_p1 = self.cached_p2 = None
             self.cached_path_nodes = None
             self.cached_emin = self.cached_emax = None
@@ -1252,8 +1148,9 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
             self.cached_bias_energy_line = self.cached_bias_energy_map = None
             self.cached_marker_coords = self.cached_spec_ldos = None
             self.cached_ld_up = self.cached_ld_dn = None
-            # Only the angular toggle changes the global topo; path-extend does not.
-            if self.use_angular != prev_use_angular:
+            # Only the decay toggle changes the global topo (recompute, or load
+            # the decay-tagged cache); path-extend does not.
+            if self.use_decay_ldos != prev_decay:
                 self._broadening_topo_dirty = True
                 if self.is_running:
                     self._recompute_global_topo()
@@ -1399,7 +1296,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
             elif self.mode == 'Map':
                 t_emin, t_emax = sorted([0.0, bias_e])
                 grid_res = int(np.sqrt(len(self.grid_xy)))
-                ldos_cache_name = f"ldos_topo_{bias_e}V_{self.ldos_height}A_{grid_res}px{self._broadening_cache_suffix()}{self._angular_cache_suffix()}{self._unit_cell_cache_suffix()}{self._decay_cache_suffix()}.npy"
+                ldos_cache_name = f"ldos_topo_{bias_e}V_{self.ldos_height}A_{grid_res}px{self._broadening_cache_suffix()}{self._unit_cell_cache_suffix()}{self._decay_cache_suffix()}.npy"
                 if exists(ldos_cache_name):
                     print(f"[*] Loading Cached LDOS Topography: {ldos_cache_name}")
                     self.current_z_map = np.load(ldos_cache_name)
@@ -1429,7 +1326,8 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
                 ld_up, ld_dn, eg = self._calculate_ldos_at_points_gpu(
                     np.hstack([p_xy, self.current_z_line[:, None]]),
                     self.s_emin.val, self.s_emax.val,
-                    use_energy_decay=self.use_decay_ldos, preserve_orbitals=True)
+                    use_energy_decay=self.use_decay_ldos, preserve_orbitals=True,
+                    global_bias=abs(bias_e))
             elif self.mode == 'Map':
                 self.map_e_targets = np.linspace(self.s_emin.val, self.s_emax.val, nepts)
                 eg = cp.array(self.energies[np.searchsorted(self.energies, self.s_emin.val):np.searchsorted(self.energies, self.s_emax.val, side='right')])
@@ -1441,7 +1339,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
                         grid_z, self.energies[e_idx],
                         self.energies[min(e_idx + 1, len(self.energies) - 1)] + 1e-6,
                         use_energy_decay=self.use_decay_ldos, preserve_orbitals=True,
-                        global_bias=abs(self.s_emax.val - self.s_emin.val))
+                        global_bias=abs(bias_e))
                     ld_up_list.append(t_up[:, 0:1])
                     if t_dn is not None:
                         ld_dn_list.append(t_dn[:, 0:1])
@@ -1475,7 +1373,8 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
             pt_gpu = cp.array(np.hstack([m_coords, z_marks[:, None]]), dtype=cp.float32)
             s_up, s_dn, _ = self._calculate_ldos_at_points_gpu(
                 pt_gpu, self.s_emin.val, self.s_emax.val,
-                use_energy_decay=self.use_decay_ldos, preserve_orbitals=True)
+                use_energy_decay=self.use_decay_ldos, preserve_orbitals=True,
+                global_bias=abs(bias_e))
             s_up_np = cp.asnumpy(s_up)
             s_dn_np = cp.asnumpy(s_dn) if s_dn is not None else None
 
@@ -2094,6 +1993,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
         if self.active_obj is not None and self.active_obj[0] == 'emarker':
             idx = self.active_obj[1]
             target_e = self.map_e_targets[idx]
+            bias_e = self.s_emin.val if str(self.ldos_bias_sign).lower() in ['neg', '-', 'negative'] else self.s_emax.val
             e_idx = np.searchsorted(self.energies, target_e)
             if e_idx >= len(self.energies):
                 e_idx = len(self.energies) - 1
@@ -2102,7 +2002,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
                 grid_z, self.energies[e_idx],
                 self.energies[min(e_idx + 1, len(self.energies) - 1)] + 1e-6,
                 use_energy_decay=self.use_decay_ldos, preserve_orbitals=True,
-                global_bias=abs(self.s_emax.val - self.s_emin.val))
+                global_bias=abs(bias_e))
             self.cached_ld_up[:, idx:idx + 1] = cp.asnumpy(t_up[:, 0:1])
             if t_dn is not None and self.cached_ld_dn is not None:
                 self.cached_ld_dn[:, idx:idx + 1] = cp.asnumpy(t_dn[:, 0:1])
