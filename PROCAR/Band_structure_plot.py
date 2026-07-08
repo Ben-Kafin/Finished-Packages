@@ -23,6 +23,12 @@ from matplotlib.widgets import CheckButtons
 from collections import defaultdict
 from enum import Enum, auto
 
+try:
+    import mplcursors
+    HAS_MPLCURSORS = True
+except ImportError:
+    HAS_MPLCURSORS = False
+
 
 class SpinMode(Enum):
     COLLINEAR_UNPOL = auto()
@@ -325,12 +331,17 @@ class CPUOrbitalBandPlotter:
         self.band_raw = self.parse_band_dat()
         self._build_state_tensor()   # single heavy step; both modes read this
         self.fig = plt.figure(figsize=(12, 8))
+        # Axes -> mplcursors.Cursor registry (MOPmatcher pattern). The click
+        # handler captures this dict by reference, so rebuilds that clear and
+        # repopulate it are picked up without rewiring the event.
+        self._cursor_by_axes = {}
         # 'Orbital' toggle, bottom left.
         self._ax_toggle = self.fig.add_axes([0.01, 0.01, 0.12, 0.06])
         self._chk_orbital = CheckButtons(self._ax_toggle, ['Orbital'],
                                          [getattr(self, 'color_by', 'element') == 'orbital'])
         self._chk_orbital.on_clicked(self._on_toggle)
         self._rebuild_figure()
+        self._wire_global_click(self.fig)
         plt.show()
 
     def _on_toggle(self, label):
@@ -342,6 +353,7 @@ class CPUOrbitalBandPlotter:
     def _rebuild_figure(self):
         """Clear and redraw the figure body for the current mode, preserving the
         toggle widget axes."""
+        self._cursor_by_axes.clear()
         for ax in list(self.fig.axes):
             if ax is not self._ax_toggle:
                 self.fig.delaxes(ax)
@@ -349,6 +361,52 @@ class CPUOrbitalBandPlotter:
             self._draw_orbital_mode()
         else:
             self._draw_element_mode()
+
+    def _attach_cursor(self, ax, artists, hover_map):
+        """Attach an initially-disabled hover cursor to an axis (MOPmatcher
+        pattern): the cursor exists but shows nothing until a left click on
+        the axis arms it (see _wire_global_click). Targets the explicit
+        scatter list so reference lines (Fermi line, KLABELS guides) never
+        annotate. hover_map: scatter artist -> 1-based band number; the
+        k-point comes from the selected point's index within the artist."""
+        if not (HAS_MPLCURSORS and artists):
+            return
+        cur = mplcursors.cursor(artists, hover=True); cur.enabled = False
+        self._cursor_by_axes[ax] = cur
+
+        @cur.connect("add")
+        def _on_add(sel, hmap=hover_map):
+            band_no = hmap.get(sel.artist)
+            if band_no is None:
+                return
+            # mplcursors >= 0.5 exposes sel.index; older releases use
+            # sel.target.index. Scatter (PathCollection) indices are ints.
+            idx = getattr(sel, "index", None)
+            if idx is None:
+                idx = getattr(sel.target, "index", None)
+            if idx is None:
+                return
+            sel.annotation.set_text(f"band {band_no}\nk-point {int(idx) + 1}")
+
+    def _wire_global_click(self, fig):
+        """Figure-level click handler (MOPmatcher pattern): left-click arms
+        the hover cursor of the axes under the mouse (annotations then follow
+        the marker the mouse is over); right-click removes all annotations
+        from that axis and disarms its cursor. Clicks outside the data axes
+        (including the Orbital toggle) fall through the registry lookup."""
+        if HAS_MPLCURSORS:
+            def _on_click(event, _map=self._cursor_by_axes):
+                if event.inaxes is None: return
+                cur = _map.get(event.inaxes)
+                if cur is None: return
+                if event.button == 1:
+                    if not cur.enabled:
+                        cur.enabled = True
+                elif event.button == 3:
+                    for sel in list(cur.selections):
+                        cur.remove_selection(sel)
+                    cur.enabled = False
+            fig.canvas.mpl_connect("button_press_event", _on_click)
 
     def _draw_element_mode(self):
         """Single-panel coloring: each band point's RGB is the normalized
@@ -381,13 +439,17 @@ class CPUOrbitalBandPlotter:
             rgb = np.where(w_total[..., None] > 0, rgbw / w_total[..., None], 0.0)
         # Points with zero total -> black (matches original [0,0,0,1]).
 
+        artists, hover_map = [], {}
         for s_idx in range(self.ispin):
             for b_idx, band in enumerate(self.band_raw):
                 nk = self._band_nk[b_idx]
                 k_coords, e_coords = band['k'], band['e']
                 colors = np.ones((nk, 4), dtype=np.float64)   # alpha 1
                 colors[:, :3] = rgb[s_idx, b_idx, :nk, :]
-                ax.scatter(k_coords, e_coords, c=colors, s=15, edgecolors='none', zorder=2)
+                sc = ax.scatter(k_coords, e_coords, c=colors, s=15, edgecolors='none', zorder=2)
+                artists.append(sc)
+                hover_map[sc] = b_idx + 1
+        self._attach_cursor(ax, artists, hover_map)
 
         base_colors = [[1,0,0], [0,1,0], [0,0,1]]
         legend_elements = [Line2D([0], [0], marker='o', color='w', label=e,
@@ -429,6 +491,7 @@ class CPUOrbitalBandPlotter:
                 hue = np.where(pop[..., None] > 0, spd / pop[..., None], 0.0)  # (S,B,K,3)
             alpha = np.minimum(1.0, pop / max_pop)    # (S,B,K)
 
+            artists, hover_map = [], {}
             for s_idx in range(self.ispin):
                 for b_idx, band in enumerate(self.band_raw):
                     nk = self._band_nk[b_idx]
@@ -437,7 +500,10 @@ class CPUOrbitalBandPlotter:
                     colors[:, :3] = hue[s_idx, b_idx, :nk, :]
                     colors[:, 3] = alpha[s_idx, b_idx, :nk]
                     # Points with zero population -> alpha 0 (invisible), matching original.
-                    ax.scatter(k_coords, e_coords, c=colors, s=15, edgecolors='none', zorder=2)
+                    sc = ax.scatter(k_coords, e_coords, c=colors, s=15, edgecolors='none', zorder=2)
+                    artists.append(sc)
+                    hover_map[sc] = b_idx + 1
+            self._attach_cursor(ax, artists, hover_map)
 
             orb_colors = [[1,0,0], [0,1,0], [0,0,1]]
             legend_elements = [Line2D([0], [0], marker='o', color='w', label=orb,
