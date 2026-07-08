@@ -17,6 +17,7 @@ the coloring path is unchanged.
 import os
 import re
 import numpy as np
+import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.widgets import CheckButtons
@@ -342,7 +343,26 @@ class CPUOrbitalBandPlotter:
         self._chk_orbital.on_clicked(self._on_toggle)
         self._rebuild_figure()
         self._wire_global_click(self.fig)
+        self._report_cursor_status()
         plt.show()
+
+    def _report_cursor_status(self):
+        """Console diagnostics for the interactive cursors: both failure modes
+        (mplcursors missing from the running env, non-interactive backend) are
+        otherwise silent."""
+        backend = matplotlib.get_backend()
+        if not HAS_MPLCURSORS:
+            print("[cursor] mplcursors NOT importable in this Python environment "
+                  "-- band/k-point cursors disabled. Install with: pip install mplcursors")
+            return
+        print(f"[cursor] mplcursors OK, backend={backend}, "
+              f"cursors on {len(self._cursor_by_axes)} axes. "
+              "Left-click a band panel to enable; right-click to clear.")
+        if 'inline' in backend.lower() or backend.lower() == 'agg':
+            print("[cursor] WARNING: this backend renders a STATIC image -- clicks and "
+                  "hover never reach the plot. In Spyder set Preferences > IPython "
+                  "console > Graphics > Backend to 'Qt5' or 'Automatic' (or run "
+                  "'%matplotlib qt' in the console), then re-run.")
 
     def _on_toggle(self, label):
         states = self._chk_orbital.get_status()
@@ -402,10 +422,19 @@ class CPUOrbitalBandPlotter:
                 if event.button == 1:
                     if not cur.enabled:
                         cur.enabled = True
+                        print("[cursor] enabled -- annotations follow the mouse; "
+                              "right-click to clear")
+                    # Annotate the marker under the click right away;
+                    # mplcursors itself only picks on the next mouse motion.
+                    try:
+                        cur._on_select_event(event)
+                    except Exception:
+                        pass
                 elif event.button == 3:
                     for sel in list(cur.selections):
                         cur.remove_selection(sel)
                     cur.enabled = False
+                    print("[cursor] cleared and disabled")
             fig.canvas.mpl_connect("button_press_event", _on_click)
 
     def _draw_element_mode(self):
