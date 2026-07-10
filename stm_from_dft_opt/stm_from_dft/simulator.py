@@ -13,6 +13,7 @@ import cupyx.scipy.ndimage as cp_ndimage
 from os.path import exists, getsize, join
 from os import chdir
 from numpy.linalg import norm, inv
+from scipy.integrate import simpson
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.collections import LineCollection
 from matplotlib.widgets import Slider, CheckButtons, Button, RadioButtons, TextBox
@@ -28,15 +29,30 @@ from .locpot_manager import LocpotManager
 
 # --- CORE UTILITIES ---
 def gpu_simpson(y, x):
-    """Vectorized Simpson's Rule for GPU parity."""
+    """Vectorized composite Simpson's rule (uniform spacing) for GPU parity.
+
+    Even sample counts use composite Simpson over the first n-1 samples plus a
+    3-point parabolic (Cartwright) correction for the final interval.
+    n == 2 uses the trapezoidal rule; n == 1 returns 0.
+    """
     n = y.shape[1]
-    if n % 2 == 0:
+    if n == 1:
+        return cp.zeros(y.shape[0], dtype=y.dtype)
+    if n == 2:
         return cp.trapz(y, x=x, axis=1)
     dx = (x[-1] - x[0]) / (n - 1)
-    weights = cp.ones(n)
+    if n % 2 == 1:
+        weights = cp.ones(n)
+        weights[1:-1:2] = 4
+        weights[2:-2:2] = 2
+        return (dx / 3.0) * cp.sum(weights * y, axis=1)
+    m = n - 1
+    weights = cp.ones(m)
     weights[1:-1:2] = 4
     weights[2:-2:2] = 2
-    return (dx / 3.0) * cp.sum(weights * y, axis=1)
+    core = (dx / 3.0) * cp.sum(weights * y[:, :m], axis=1)
+    tail = (dx / 12.0) * (5.0 * y[:, -1] + 8.0 * y[:, -2] - y[:, -3])
+    return core + tail
 
 
 def gpu_chen_tunneling_factor(V, E, phi):
@@ -306,11 +322,11 @@ class Unified_STM_Simulator:
 
     def _decay_cache_suffix(self):
         # Converged topographies depend on the decay model used to produce them.
-        return "" if getattr(self, 'use_decay_topo', True) else "_nodecay"
+        return "" if getattr(self, 'use_decay', True) else "_nodecay"
 
     def _calculate_ldos_at_points_gpu(self, tip_positions, emin, emax,
                                       use_energy_decay=False, preserve_orbitals=False,
-                                      global_bias=None, topo_only=False):
+                                      topo_only=False):
         estart = np.searchsorted(self.energies, emin)
         eend = np.searchsorted(self.energies, emax, side='right')
         energy_indices = cp.arange(estart, eend)
@@ -336,8 +352,7 @@ class Unified_STM_Simulator:
                 dos_periodic = dos_collapsed[self.atom_indices_periodic_gpu, :]
                 dos_active = dos_periodic[:, energy_indices]
                 if use_energy_decay:
-                    bias_v = cp.asarray(global_bias if global_bias is not None else (emax - emin), dtype=cp.float32)
-                    K_all = gpu_chen_tunneling_factor(bias_v, calc_energies_gpu[:, None], phi_local)
+                    K_all = gpu_chen_tunneling_factor(cp.abs(calc_energies_gpu)[:, None], calc_energies_gpu[:, None], phi_local)
                     for e_idx in range(num_e):
                         sf = cp.exp(-1.0 * dists * K_all[e_idx][None, :] * 1e-10)
                         output_ldos[:, e_idx] = cp.dot(sf.T, dos_active[:, e_idx])
@@ -348,8 +363,7 @@ class Unified_STM_Simulator:
             else:
                 output_ldos = cp.zeros((num_pts, num_e, self.num_total_atoms, dos_gpu.shape[2]), dtype=cp.float32)
                 if use_energy_decay:
-                    bias_v = cp.asarray(global_bias if global_bias is not None else (emax - emin), dtype=cp.float32)
-                    K_all = gpu_chen_tunneling_factor(bias_v, calc_energies_gpu[:, None], phi_local)
+                    K_all = gpu_chen_tunneling_factor(cp.abs(calc_energies_gpu)[:, None], calc_energies_gpu[:, None], phi_local)
                     for e_idx in range(num_e):
                         sf = cp.exp(-1.0 * dists * K_all[e_idx][None, :] * 1e-10)
                         w_atom = cp.dot(self.map_mat_gpu, sf)
@@ -429,7 +443,8 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
         self.npts = 72
         self.is_running, self.normalize, self.show_mag = False, False, False
         self.show_atoms, self.show_unit_cell = True, False
-        self.use_decay_topo, self.use_decay_ldos = True, True
+        self.use_decay = True
+        self.reuse_cache = True
         self.show_decay_toggle = True
         self.display_cells = 1
         self.mode = 'Single Point'
@@ -471,12 +486,15 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
         self._slider_textboxes = []
 
     def run_interactive(self, grid_res=64, topo_bias=0.2, topo_height=2.5,
-                        ldos_bias_sign='neg', use_decay_topo=True, use_decay_ldos=True,
-                        show_decay_toggle=True,
+                        ldos_bias_sign='neg', use_decay=True,
+                        show_decay_toggle=True, reuse_cache=True,
                         line_endpoints=None, marker_positions=None, extra_broadening=None,
                         path=None, path_extend=False):
+        if topo_bias is None or topo_bias == 0:
+            raise ValueError(f"topo_bias must be a nonzero bias voltage in volts; received {topo_bias!r}.")
         self.ldos_bias_sign = ldos_bias_sign
-        self.use_decay_topo, self.use_decay_ldos = use_decay_topo, use_decay_ldos
+        self.use_decay = use_decay
+        self.reuse_cache = reuse_cache
         self.show_decay_toggle = bool(show_decay_toggle)
         if line_endpoints is not None:
             self.p1, self.p2 = np.array(line_endpoints[0], dtype=float), np.array(line_endpoints[1], dtype=float)
@@ -534,7 +552,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
         z_fixed = cp.full(grid_xy_gpu.shape[0], self.z_highest_atom + topo_height, dtype=cp.float32)
         t_emin, t_emax = sorted([0.0, topo_bias])
         cache_name = f"global_topo_{topo_bias}V_{topo_height}A_{grid_res}px{self._broadening_cache_suffix()}{self._unit_cell_cache_suffix()}{self._decay_cache_suffix()}.npy"
-        if exists(cache_name):
+        if self.reuse_cache and exists(cache_name):
             print(f"[*] Loading Cached Global Topography: {cache_name}")
             self.current_z_map = np.load(cache_name)
             z_map_gpu = cp.array(self.current_z_map, dtype=cp.float32)
@@ -542,10 +560,10 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
             print(f"[*] Cache not found. Calculating Global Topography: {cache_name}")
             ld_1, _, init_engs = self._calculate_ldos_at_points_gpu(
                 cp.hstack([grid_xy_gpu, z_fixed[:, None]]), t_emin, t_emax,
-                use_energy_decay=self.use_decay_topo, preserve_orbitals=False, topo_only=True)
+                use_energy_decay=self.use_decay, preserve_orbitals=False, topo_only=True)
             target_setp = cp.max(gpu_simpson(ld_1, init_engs))
             print(f"[*] Global Setpoint LDOS: {float(target_setp):.6e}")
-            z_map_gpu = self._converge_tip_height(z_fixed, grid_xy_gpu, t_emin, t_emax, target_setp, use_decay=self.use_decay_topo)
+            z_map_gpu = self._converge_tip_height(z_fixed, grid_xy_gpu, t_emin, t_emax, target_setp, use_decay=self.use_decay)
             self.current_z_map = cp.asnumpy(z_map_gpu)
             np.save(cache_name, self.current_z_map)
         self.grid_xy = grid_xy
@@ -866,7 +884,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
         self.btn_run = Button(plt.axes([0.02, 0.02, 0.05, 0.06]), 'RUN', color='lightgray', hovercolor='lime')
         # One list defines every checkbox: label and the attribute it drives.
         # CheckButtons construction and the click handler both iterate this list.
-        toggle_defs = [('Atoms', 'show_atoms'), ('Decay', 'use_decay_ldos'),
+        toggle_defs = [('Atoms', 'show_atoms'), ('Decay', 'use_decay'),
                        ('Norm', 'normalize'), ('Mag', 'show_mag'),
                        ('Cell', 'show_unit_cell'), ('Extend', 'path_extend')]
         if not getattr(self, 'show_decay_toggle', True):
@@ -1052,7 +1070,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
         """Re-run Phase 1 global topography with current broadened DOS (cache-aware)."""
         grid_res = int(np.sqrt(len(self.grid_xy)))
         cache_name = f"global_topo_{self.global_topo_bias}V_{self.topo_height}A_{grid_res}px{self._broadening_cache_suffix()}{self._unit_cell_cache_suffix()}{self._decay_cache_suffix()}.npy"
-        if exists(cache_name):
+        if self.reuse_cache and exists(cache_name):
             print(f"[*] Loading Cached Global Topography: {cache_name}")
             self.current_z_map = np.load(cache_name)
         else:
@@ -1061,10 +1079,10 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
             z_fixed = cp.full(self.grid_xy_gpu.shape[0], self.z_highest_atom + self.topo_height, dtype=cp.float32)
             ld_1, _, init_engs = self._calculate_ldos_at_points_gpu(
                 cp.hstack([self.grid_xy_gpu, z_fixed[:, None]]), t_emin, t_emax,
-                use_energy_decay=self.use_decay_topo, preserve_orbitals=False, topo_only=True)
+                use_energy_decay=self.use_decay, preserve_orbitals=False, topo_only=True)
             target_setp = cp.max(gpu_simpson(ld_1, init_engs))
             print(f"[*] Global Setpoint LDOS: {float(target_setp):.6e}")
-            z_map_gpu = self._converge_tip_height(z_fixed, self.grid_xy_gpu, t_emin, t_emax, target_setp, use_decay=self.use_decay_topo)
+            z_map_gpu = self._converge_tip_height(z_fixed, self.grid_xy_gpu, t_emin, t_emax, target_setp, use_decay=self.use_decay)
             self.current_z_map = cp.asnumpy(z_map_gpu)
             np.save(cache_name, self.current_z_map)
         self.global_z_map = self.current_z_map.copy()
@@ -1072,8 +1090,9 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
     def _on_topo_height_rerun(self, event):
         """Apply the global-topo tip-height slider and recompute the global topo.
         Static-label, single-action button. Does nothing unless the main RUN
-        button is active. Never deletes/overwrites caches (height-encoded
-        filenames are load-or-create)."""
+        button is active. Height-encoded cache filenames are loaded when
+        reuse_cache is True and recomputed and rewritten when reuse_cache is
+        False."""
         if not self.is_running:
             return
         self.topo_height = float(self.s_topo_h.val)
@@ -1084,8 +1103,10 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
     def _on_ldos_height_rerun(self, event):
         """Apply the LDOS-topo tip-height slider and recompute LDOS topo.
         Static-label, single-action button. Does nothing unless the main RUN
-        button is active. Resets only in-RAM frame caches (forces recompute /
-        reload at the new height); never deletes/overwrites disk caches."""
+        button is active. Resets in-RAM frame caches (forces recompute / reload
+        at the new height); disk caches of the same name are loaded when
+        reuse_cache is True and recomputed and rewritten when reuse_cache is
+        False."""
         if not self.is_running:
             return
         self.ldos_height = float(self.s_ldos_h.val)
@@ -1124,22 +1145,18 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
             self._update_all(full_refresh=True)
 
     def _on_ui_change(self, val):
-        prev_decay = self.use_decay_ldos
+        prev_decay = self.use_decay
         prev_path_extend = self.path_extend
         states = self.chk.get_status()
         for (label, attr), state in zip(self._toggle_defs, states):
             setattr(self, attr, state)
-        # The Decay checkbox drives every decay-dependent evaluation in every
-        # mode: lock the topo flag to the LDOS flag so the convergence engines
-        # and the final curves always share one decay model.
-        self.use_decay_topo = self.use_decay_ldos
         self.display_cells = int(self.s_cell.val)
         if hasattr(self, 's_ldos_gamma'):
             self.ldos_gamma = float(self.s_ldos_gamma.val)
         self._sync_textboxes()
 
         # Decay toggle OR path-extend toggle: invalidate caches and recompute.
-        if (self.use_decay_ldos != prev_decay) or (self.path_extend != prev_path_extend):
+        if (self.use_decay != prev_decay) or (self.path_extend != prev_path_extend):
             self.cached_p1 = self.cached_p2 = None
             self.cached_path_nodes = None
             self.cached_emin = self.cached_emax = None
@@ -1150,7 +1167,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
             self.cached_ld_up = self.cached_ld_dn = None
             # Only the decay toggle changes the global topo (recompute, or load
             # the decay-tagged cache); path-extend does not.
-            if self.use_decay_ldos != prev_decay:
+            if self.use_decay != prev_decay:
                 self._broadening_topo_dirty = True
                 if self.is_running:
                     self._recompute_global_topo()
@@ -1268,36 +1285,38 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
 
         bias_e = self.s_emin.val if str(self.ldos_bias_sign).lower() in ['neg', '-', 'negative'] else self.s_emax.val
         nepts = int(self.s_nepts.val) if hasattr(self, 's_nepts') else None
-        needs_topo = ((self.mode == 'Line' and (self.cached_p1 is None or not np.array_equal(self.p1, self.cached_p1) or not np.array_equal(self.p2, self.cached_p2) or self.cached_bias_energy_line != bias_e or self.cached_d_topo_line != self.use_decay_topo)) or
-                      (self.mode == 'Path' and (self.cached_path_nodes is None or not np.array_equal(np.array(self.path_nodes), self.cached_path_nodes) or self.cached_path_extend != self.path_extend or self.cached_bias_energy_line != bias_e or self.cached_d_topo_line != self.use_decay_topo)) or
-                      (self.mode == 'Map' and (self.cached_bias_energy_map != bias_e or self.cached_d_topo_map != self.use_decay_topo)))
+        needs_topo = ((self.mode == 'Line' and (self.cached_p1 is None or not np.array_equal(self.p1, self.cached_p1) or not np.array_equal(self.p2, self.cached_p2) or self.cached_bias_energy_line != bias_e or self.cached_d_topo_line != self.use_decay)) or
+                      (self.mode == 'Path' and (self.cached_path_nodes is None or not np.array_equal(np.array(self.path_nodes), self.cached_path_nodes) or self.cached_path_extend != self.path_extend or self.cached_bias_energy_line != bias_e or self.cached_d_topo_line != self.use_decay)) or
+                      (self.mode == 'Map' and (self.cached_bias_energy_map != bias_e or self.cached_d_topo_map != self.use_decay)))
         needs_ldos = (needs_topo or self.cached_emin != self.s_emin.val or self.cached_emax != self.s_emax.val or
-                      self.cached_d_ldos != self.use_decay_ldos or getattr(self, 'cached_mode', None) != self.mode or
+                      self.cached_d_ldos != self.use_decay or getattr(self, 'cached_mode', None) != self.mode or
                       (self.mode == 'Map' and self.cached_nepts != nepts))
         needs_spec = (needs_ldos or (self.mode in ['Single Point', 'Map'] and (self.cached_marker_coords is None or not np.array_equal(self.marker_coords, self.cached_marker_coords))))
 
         if needs_topo:
+            if bias_e == 0:
+                raise ValueError("Stabilization bias is 0: set a nonzero E Min or E Max (per ldos_bias_sign) before the constant-current window can be built.")
             if self.mode in ('Line', 'Path'):
                 l_emin, l_emax = sorted([0.0, bias_e])
                 p_xy_gpu = cp.array(p_xy, dtype=cp.float32)
                 ld_1, _, l_engs = self._calculate_ldos_at_points_gpu(
                     cp.hstack([p_xy_gpu, cp.full((self.npts, 1), self.z_highest_atom + self.ldos_height, dtype=cp.float32)]),
-                    l_emin, l_emax, use_energy_decay=self.use_decay_topo, preserve_orbitals=False, topo_only=True)
+                    l_emin, l_emax, use_energy_decay=self.use_decay, preserve_orbitals=False, topo_only=True)
                 target = cp.max(gpu_simpson(ld_1, l_engs))
                 print(f"[*] Path Setpoint LDOS: {float(target):.6e}")
-                z_line = self._converge_tip_height(cp.full(self.npts, self.z_highest_atom + self.ldos_height, dtype=cp.float32), p_xy_gpu, l_emin, l_emax, target, use_decay=self.use_decay_topo)
+                z_line = self._converge_tip_height(cp.full(self.npts, self.z_highest_atom + self.ldos_height, dtype=cp.float32), p_xy_gpu, l_emin, l_emax, target, use_decay=self.use_decay)
                 self.current_z_line = cp.asnumpy(z_line)
                 if self.mode == 'Line':
                     self.cached_p1, self.cached_p2 = self.p1.copy(), self.p2.copy()
                 else:
                     self.cached_path_nodes = np.array(self.path_nodes).copy()
                     self.cached_path_extend = self.path_extend
-                self.cached_bias_energy_line, self.cached_d_topo_line = bias_e, self.use_decay_topo
+                self.cached_bias_energy_line, self.cached_d_topo_line = bias_e, self.use_decay
             elif self.mode == 'Map':
                 t_emin, t_emax = sorted([0.0, bias_e])
                 grid_res = int(np.sqrt(len(self.grid_xy)))
                 ldos_cache_name = f"ldos_topo_{bias_e}V_{self.ldos_height}A_{grid_res}px{self._broadening_cache_suffix()}{self._unit_cell_cache_suffix()}{self._decay_cache_suffix()}.npy"
-                if exists(ldos_cache_name):
+                if self.reuse_cache and exists(ldos_cache_name):
                     print(f"[*] Loading Cached LDOS Topography: {ldos_cache_name}")
                     self.current_z_map = np.load(ldos_cache_name)
                 else:
@@ -1305,13 +1324,13 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
                     z_fixed = cp.full(self.grid_xy_gpu.shape[0], self.z_highest_atom + self.ldos_height, dtype=cp.float32)
                     ld_1, _, init_engs = self._calculate_ldos_at_points_gpu(
                         cp.hstack([self.grid_xy_gpu, z_fixed[:, None]]), t_emin, t_emax,
-                        use_energy_decay=self.use_decay_topo, preserve_orbitals=False, topo_only=True)
+                        use_energy_decay=self.use_decay, preserve_orbitals=False, topo_only=True)
                     target_setp = cp.max(gpu_simpson(ld_1, init_engs))
                     print(f"[*] Map Local Setpoint LDOS: {float(target_setp):.6e}")
-                    z_map_gpu = self._converge_tip_height(z_fixed, self.grid_xy_gpu, t_emin, t_emax, target_setp, use_decay=self.use_decay_topo)
+                    z_map_gpu = self._converge_tip_height(z_fixed, self.grid_xy_gpu, t_emin, t_emax, target_setp, use_decay=self.use_decay)
                     self.current_z_map = cp.asnumpy(z_map_gpu)
                     np.save(ldos_cache_name, self.current_z_map)
-                self.cached_bias_energy_map, self.cached_d_topo_map = bias_e, self.use_decay_topo
+                self.cached_bias_energy_map, self.cached_d_topo_map = bias_e, self.use_decay
                 self.ax_map.clear()
                 n = int(self.s_cell.val)
                 for i in range(-n, n + 1):
@@ -1326,8 +1345,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
                 ld_up, ld_dn, eg = self._calculate_ldos_at_points_gpu(
                     np.hstack([p_xy, self.current_z_line[:, None]]),
                     self.s_emin.val, self.s_emax.val,
-                    use_energy_decay=self.use_decay_ldos, preserve_orbitals=True,
-                    global_bias=abs(bias_e))
+                    use_energy_decay=self.use_decay, preserve_orbitals=True)
             elif self.mode == 'Map':
                 self.map_e_targets = np.linspace(self.s_emin.val, self.s_emax.val, nepts)
                 eg = cp.array(self.energies[np.searchsorted(self.energies, self.s_emin.val):np.searchsorted(self.energies, self.s_emax.val, side='right')])
@@ -1338,8 +1356,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
                     t_up, t_dn, _ = self._calculate_ldos_at_points_gpu(
                         grid_z, self.energies[e_idx],
                         self.energies[min(e_idx + 1, len(self.energies) - 1)] + 1e-6,
-                        use_energy_decay=self.use_decay_ldos, preserve_orbitals=True,
-                        global_bias=abs(bias_e))
+                        use_energy_decay=self.use_decay, preserve_orbitals=True)
                     ld_up_list.append(t_up[:, 0:1])
                     if t_dn is not None:
                         ld_dn_list.append(t_dn[:, 0:1])
@@ -1354,7 +1371,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
                 self.cached_ld_dn = cp.asnumpy(ld_dn) if ld_dn is not None else None
             self.cached_eg = cp.asnumpy(eg)
             self.cached_emin, self.cached_emax = self.s_emin.val, self.s_emax.val
-            self.cached_d_ldos, self.cached_nepts = self.use_decay_ldos, nepts
+            self.cached_d_ldos, self.cached_nepts = self.use_decay, nepts
             self.cached_mode = self.mode
 
         if needs_spec and self.mode in ['Single Point', 'Map']:
@@ -1373,8 +1390,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
             pt_gpu = cp.array(np.hstack([m_coords, z_marks[:, None]]), dtype=cp.float32)
             s_up, s_dn, _ = self._calculate_ldos_at_points_gpu(
                 pt_gpu, self.s_emin.val, self.s_emax.val,
-                use_energy_decay=self.use_decay_ldos, preserve_orbitals=True,
-                global_bias=abs(bias_e))
+                use_energy_decay=self.use_decay, preserve_orbitals=True)
             s_up_np = cp.asnumpy(s_up)
             s_dn_np = cp.asnumpy(s_dn) if s_dn is not None else None
 
@@ -1425,7 +1441,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
         active_ldos_norm = active_ldos.copy()
         if self.normalize:
             total_for_norm = np.sum(active_ldos_norm, axis=(1, 2))
-            norm_factor = (np.trapezoid(total_for_norm, x=self.cached_eg) + 1e-15)
+            norm_factor = (simpson(total_for_norm, x=self.cached_eg) + 1e-15)
             active_ldos_norm /= norm_factor
 
         if self.plot_level == 0:
@@ -1435,7 +1451,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
                     c_ldos = f_ldos_raw[idx].copy()
                     t_y = np.sum(c_ldos, axis=(1, 2))
                     if self.normalize:
-                        t_y /= (np.trapezoid(t_y, x=self.cached_eg) + 1e-15)
+                        t_y /= (simpson(t_y, x=self.cached_eg) + 1e-15)
                     color = self.m_colors[i % len(self.m_colors)]
                     self.ax_spec.plot(self.cached_eg, t_y, color=color, lw=2.5, picker=True, pickradius=5, label=f'marker_{i}')
             else:
@@ -1443,7 +1459,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
                     c_ldos = self.cached_spec_ldos[i].copy()
                     t_y = np.sum(c_ldos, axis=(1, 2))
                     if self.normalize:
-                        t_y /= (np.trapezoid(t_y, x=self.cached_eg) + 1e-15)
+                        t_y /= (simpson(t_y, x=self.cached_eg) + 1e-15)
                     color = self.m_colors[i % len(self.m_colors)]
                     self.ax_spec.plot(self.cached_eg, t_y, color=color, lw=2.5, picker=True, pickradius=5, label=f'marker_{i}')
             self.ax_spec.legend(loc='upper right', frameon=False)
@@ -1544,7 +1560,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
 
             if self.normalize and f_ldos_raw is not None:
                 total_ldos_line = np.sum(f_ldos_raw, axis=(2, 3))
-                norm_denom_line = np.trapezoid(total_ldos_line, x=self.cached_eg, axis=1)[:, None] + 1e-15
+                norm_denom_line = simpson(total_ldos_line, x=self.cached_eg, axis=1)[:, None] + 1e-15
             else:
                 norm_denom_line = 1.0
 
@@ -1749,7 +1765,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
             if self.normalize and f_ldos_raw is not None:
                 total_ldos_map = np.sum(f_ldos_raw, axis=(2, 3))
                 s_idx = np.argsort(self.map_e_targets)
-                norm_denom_map = np.trapezoid(total_ldos_map[:, s_idx], x=self.map_e_targets[s_idx], axis=1)[:, None] + 1e-15
+                norm_denom_map = simpson(total_ldos_map[:, s_idx], x=self.map_e_targets[s_idx], axis=1)[:, None] + 1e-15
             else:
                 norm_denom_map = 1.0
 
@@ -1847,7 +1863,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
         if self.normalize and f_ldos_raw is not None:
             total_ldos_map = np.sum(f_ldos_raw, axis=(2, 3))
             s_idx = np.argsort(self.map_e_targets)
-            norm_denom_map = np.trapezoid(total_ldos_map[:, s_idx], x=self.map_e_targets[s_idx], axis=1)[:, None] + 1e-15
+            norm_denom_map = simpson(total_ldos_map[:, s_idx], x=self.map_e_targets[s_idx], axis=1)[:, None] + 1e-15
         else:
             norm_denom_map = 1.0
 
@@ -2001,8 +2017,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
             t_up, t_dn, _ = self._calculate_ldos_at_points_gpu(
                 grid_z, self.energies[e_idx],
                 self.energies[min(e_idx + 1, len(self.energies) - 1)] + 1e-6,
-                use_energy_decay=self.use_decay_ldos, preserve_orbitals=True,
-                global_bias=abs(bias_e))
+                use_energy_decay=self.use_decay, preserve_orbitals=True)
             self.cached_ld_up[:, idx:idx + 1] = cp.asnumpy(t_up[:, 0:1])
             if t_dn is not None and self.cached_ld_dn is not None:
                 self.cached_ld_dn[:, idx:idx + 1] = cp.asnumpy(t_dn[:, 0:1])
