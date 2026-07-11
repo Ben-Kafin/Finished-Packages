@@ -55,36 +55,6 @@ def gpu_simpson(y, x):
     return core + tail
 
 
-def gpu_simpson_weights(n, dx, dtype=cp.float32):
-    """Quadrature weight vector reproducing gpu_simpson exactly.
-
-    Σ_i w_i·y_i equals gpu_simpson(y, x) for a uniform grid of n samples with
-    spacing dx, branch for branch (n == 1 → 0, n == 2 → trapezoid, odd n →
-    composite Simpson, even n → composite over n-1 plus the Cartwright tail).
-    Used where the integrand tensor is too large to materialize per energy.
-    """
-    if n == 1:
-        return cp.zeros(1, dtype=dtype)
-    if n == 2:
-        return cp.full(2, dx / 2.0, dtype=dtype)
-    w = np.zeros(n)
-    if n % 2 == 1:
-        ws = np.ones(n)
-        ws[1:-1:2] = 4
-        ws[2:-2:2] = 2
-        w = (dx / 3.0) * ws
-    else:
-        m = n - 1
-        wm = np.ones(m)
-        wm[1:-1:2] = 4
-        wm[2:-2:2] = 2
-        w[:m] = (dx / 3.0) * wm
-        w[-1] += 5.0 * dx / 12.0
-        w[-2] += 8.0 * dx / 12.0
-        w[-3] -= dx / 12.0
-    return cp.asarray(w, dtype=dtype)
-
-
 def gpu_chen_tunneling_factor(V, E, phi):
     """Vectorized Julian Chen barrier model character-for-character."""
     me, h, q = 9.1093837e-31, 6.62607015e-34, 1.60217663e-19
@@ -109,7 +79,7 @@ class Unified_STM_Simulator:
 
     def _converge_tip_height(self, z_map_gpu, grid_xy_gpu, emin, emax, target_ldos,
                              target_threshold=0.01, topo_gain=0.5, max_iter=1000, use_decay=True,
-                             decay_mode='instantaneous', frozen_bias=None, clamp_occupied=False):
+                             clamp_occupied=False):
         """Exhaustive Point-Wise Convergence Engine."""
         t_start = time()
         print("--- INITIALIZING TIP CONVERGENCE ENGINE ---")
@@ -118,12 +88,10 @@ class Unified_STM_Simulator:
             ld_1, _, a_grid = self._calculate_ldos_at_points_gpu(
                 cp.hstack([grid_xy_gpu, z_map_gpu[:, None]]), emin, emax,
                 use_energy_decay=use_decay, preserve_orbitals=False, topo_only=True,
-                decay_mode=decay_mode, frozen_bias=frozen_bias, clamp_occupied=clamp_occupied)
+                clamp_occupied=clamp_occupied)
             # Topography always uses total LDOS — ld_1 is already combined for POL when topo_only=True.
             cur_ldos = gpu_simpson(ld_1, a_grid)
-            if decay_mode == 'frozen' and frozen_bias is not None and frozen_bias < 0:
-                cur_ldos = -cur_ldos   # §4.2: topo current is signed; negative bias → negative field
-            rat = cp.maximum(cp.abs(cur_ldos), 1e-20) / cp.abs(target_ldos)
+            rat = cp.maximum(cur_ldos, 1e-20) / target_ldos
 
             active_mask = cp.abs(rat - 1.0) > target_threshold
             active_count = int(cp.sum(active_mask))
@@ -355,65 +323,26 @@ class Unified_STM_Simulator:
         return f"_uc{getattr(self, 'unit_cell_num', 1)}"
 
     def _effective_decay_model(self):
-        """§0 effective model from the two decay controls: t1 / t2 / t2c / t3.
-
-        The clamp checkbox only has effect under Tier 2; under Off or Tier 3
-        its state is ignored."""
-        tier = getattr(self, 'decay_tier', 'Off')
-        if tier == 'Tier 3':
-            return 't3'
-        if tier == 'Tier 2':
-            return 't2c' if getattr(self, 't2_clamp', False) else 't2'
-        return 't1'
-
-    def _decay_call_kwargs(self, frozen_bias=None):
-        """_calculate_ldos_at_points_gpu kwargs for the current effective model.
-
-        Topography callers pass their signed stabilization bias (§4.2); display
-        callers pass nothing — under t3 that selects the signed I(V)-column
-        numerical-dI/dV path (§4.3)."""
-        model = self._effective_decay_model()
-        kw = dict(use_energy_decay=model != 't1', decay_mode='instantaneous',
-                  frozen_bias=None, clamp_occupied=model == 't2c')
-        if model == 't3':
-            kw['decay_mode'] = 'frozen' if frozen_bias is not None else 't3_display'
-            kw['frozen_bias'] = frozen_bias
-        return kw
-
-    def _topo_setpoint(self, ld_1, engs, bias):
-        """§4.2 setpoint: under t3 the signed value at the maximum-magnitude
-        location; under t1/t2/t2c today's positive maximum, unchanged."""
-        integ = gpu_simpson(ld_1, engs)
-        if self._effective_decay_model() == 't3':
-            return (1.0 if bias > 0 else -1.0) * cp.max(cp.abs(integ))
-        return cp.max(integ)
+        """'t1' = Decay off; 't2' = Decay on; 't2c' = Decay on + 0-clamp."""
+        if not getattr(self, 'use_decay', True):
+            return 't1'
+        return 't2c' if getattr(self, 't2_clamp', False) else 't2'
 
     def _decay_cache_suffix(self):
         # Converged topographies depend on the decay model used to produce them.
-        # §5: exactly one token per effective model. Pre-change tags ('' for on,
-        # '_nodecay' for off) can never match, so old caches never load.
-        return "_" + self._effective_decay_model()
+        # Decay on/off keep their pre-clamp tags (existing caches stay valid);
+        # the occupied-side 0-clamp model gets its own tag.
+        if not getattr(self, 'use_decay', True):
+            return "_nodecay"
+        return "_clamp" if getattr(self, 't2_clamp', False) else ""
 
     def _calculate_ldos_at_points_gpu(self, tip_positions, emin, emax,
                                       use_energy_decay=False, preserve_orbitals=False,
-                                      topo_only=False, decay_mode='instantaneous',
-                                      frozen_bias=None, clamp_occupied=False):
+                                      topo_only=False, clamp_occupied=False):
         estart = np.searchsorted(self.energies, emin)
         eend = np.searchsorted(self.energies, emax, side='right')
         energy_indices = cp.arange(estart, eend)
         calc_energies_gpu = self.energies_gpu[estart:eend]
-        if decay_mode == 'frozen':
-            if frozen_bias is None:
-                raise ValueError("decay_mode='frozen' requires a signed frozen_bias (eV).")
-            # §4.1 window (amended by user ruling): 0 ≤ sign(V_b)·ε ≤ |V_b| —
-            # both polarities reach to AND INCLUDE the Fermi grid point, so the
-            # frozen E-argument samples are identical for ±|V_b|. The slice
-            # bounds already cap at |V_b|; drop any wrong-side state.
-            keep = np.sign(frozen_bias) * self.energies[estart:eend] >= 0.0
-            if not keep.all():
-                keep_gpu = cp.asarray(keep)
-                energy_indices = energy_indices[keep_gpu]
-                calc_energies_gpu = calc_energies_gpu[keep_gpu]
         num_pts, num_e = tip_positions.shape[0], len(calc_energies_gpu)
         tip_pos_gpu = cp.asarray(tip_positions, dtype=cp.float32)
         frac_coords = cp.dot(tip_pos_gpu, self.inv_lv_gpu)
@@ -428,93 +357,17 @@ class Unified_STM_Simulator:
         grid_indices = (frac_coords % 1.0).T * self.locpot_dims_gpu[:, None]
         dists = cp.sqrt(cp.sum((self.periodic_coord_gpu[:, None, :] - wrapped_tip_pos_gpu[None, :, :]) ** 2, axis=2))
 
-        def _frozen_K(phi_local, v_b, eps_gpu):
-            """§4.1 frozen mapping: V = |V_b|; E = ε + max(−V_b, 0) (≥ 0 in-window)."""
-            return gpu_chen_tunneling_factor(
-                abs(v_b), (eps_gpu + max(-v_b, 0.0))[:, None], phi_local)
-
-        def _leading_K(phi_local):
-            """K [1/m] per (state, point) for the per-energy decay factor."""
-            if decay_mode == 'frozen':
-                return _frozen_K(phi_local, frozen_bias, calc_energies_gpu)
-            # t2: today's instantaneous arguments, bit-identical.
-            # t2c (§3): only the E argument changes — clamped at the Fermi level.
-            e_arg = cp.maximum(calc_energies_gpu, 0.0) if clamp_occupied else calc_energies_gpu
-            return gpu_chen_tunneling_factor(
-                cp.abs(calc_energies_gpu)[:, None], e_arg[:, None], phi_local)
-
-        def _t3_display_channel(phi_local, dos_gpu, dos_collapsed):
-            """§4.3: signed I(V_j) from each display grid energy's frozen column
-            window (full DOSCAR grid, Fermi → V_j), then numerical dI/dV —
-            central differences, one-sided at the two display-range ends."""
-            d_e = float(self.energies[1] - self.energies[0])
-            n_per = dists.shape[0]
-            chunk = max(1, int(16_777_216 // max(1, n_per * num_pts)))
-            if preserve_orbitals:
-                I_of_v = cp.zeros((num_pts, num_e, self.num_total_atoms, dos_gpu.shape[2]),
-                                  dtype=cp.float32)
-            else:
-                dos_periodic_full = dos_collapsed[self.atom_indices_periodic_gpu, :]
-                I_of_v = cp.zeros((num_pts, num_e), dtype=cp.float32)
-            for e_idx in range(num_e):
-                v_j = float(self.energies[estart + e_idx])
-                # Column window (user ruling): reaches to and includes the
-                # Fermi grid point on both polarities: 0 ≤ sign(V_j)·ε ≤ |V_j|.
-                if v_j > 0:
-                    col = np.nonzero((self.energies >= 0.0) & (self.energies <= v_j))[0]
-                elif v_j < 0:
-                    col = np.nonzero((self.energies <= 0.0) & (self.energies >= v_j))[0]
-                else:
-                    continue   # V_j = 0: empty column window → I(V_j) = 0
-                n_col = len(col)
-                if n_col == 0:
-                    continue
-                sgn = 1.0 if v_j > 0 else -1.0
-                if preserve_orbitals:
-                    # Column carried per orbital channel before this branch's
-                    # reduction: gpu_simpson's exact weights applied per
-                    # (atom, energy) with the periodic-image reduction.
-                    w_col = gpu_simpson_weights(n_col, d_e)
-                    acc = cp.zeros((num_pts, self.num_total_atoms, dos_gpu.shape[2]),
-                                   dtype=cp.float32)
-                    for c0 in range(0, n_col, chunk):
-                        idx_c = col[c0:c0 + chunk]
-                        eps_c = cp.asarray(self.energies[idx_c], dtype=cp.float32)
-                        K_c = _frozen_K(phi_local, v_j, eps_c).astype(cp.float32)
-                        sf = cp.exp(-K_c[:, None, :] * dists[None, :, :] * 1e-10)
-                        w_atom = cp.einsum('mn,inp->imp', self.map_mat_gpu, sf)
-                        acc += cp.einsum('i,imp,mio->pmo', w_col[c0:c0 + len(idx_c)],
-                                         w_atom, dos_gpu[:, cp.asarray(idx_c), :])
-                    I_of_v[:, e_idx] = sgn * acc
-                else:
-                    y = cp.zeros((num_pts, n_col), dtype=cp.float32)
-                    for c0 in range(0, n_col, chunk):
-                        idx_c = col[c0:c0 + chunk]
-                        eps_c = cp.asarray(self.energies[idx_c], dtype=cp.float32)
-                        K_c = _frozen_K(phi_local, v_j, eps_c).astype(cp.float32)
-                        sf = cp.exp(-K_c[:, None, :] * dists[None, :, :] * 1e-10)
-                        y[:, c0:c0 + len(idx_c)] = cp.einsum(
-                            'ai,iap->pi', dos_periodic_full[:, cp.asarray(idx_c)], sf)
-                    I_of_v[:, e_idx] = sgn * gpu_simpson(
-                        y, cp.asarray(self.energies[col], dtype=cp.float32))
-            didv = cp.zeros_like(I_of_v)
-            if num_e >= 2:
-                didv[:, 0] = (I_of_v[:, 1] - I_of_v[:, 0]) / d_e
-                didv[:, num_e - 1] = (I_of_v[:, num_e - 1] - I_of_v[:, num_e - 2]) / d_e
-                if num_e > 2:
-                    didv[:, 1:num_e - 1] = (I_of_v[:, 2:] - I_of_v[:, :num_e - 2]) / (2.0 * d_e)
-            return didv
-
         def _compute_channel(pot, dos_gpu, dos_collapsed):
             phi_local = cp_ndimage.map_coordinates(pot, grid_indices, order=1, mode='wrap') - self.ef
-            if use_energy_decay and decay_mode == 't3_display':
-                return _t3_display_channel(phi_local, dos_gpu, dos_collapsed)
             if not preserve_orbitals:
                 output_ldos = cp.zeros((num_pts, num_e), dtype=cp.float32)
                 dos_periodic = dos_collapsed[self.atom_indices_periodic_gpu, :]
                 dos_active = dos_periodic[:, energy_indices]
                 if use_energy_decay:
-                    K_all = _leading_K(phi_local)
+                    # 0-clamp: E anchored at the Fermi level for occupied states,
+                    # moving the eps < 0 averaging interval to [phi, phi + |eps|].
+                    e_arg = cp.maximum(calc_energies_gpu, 0.0) if clamp_occupied else calc_energies_gpu
+                    K_all = gpu_chen_tunneling_factor(cp.abs(calc_energies_gpu)[:, None], e_arg[:, None], phi_local)
                     for e_idx in range(num_e):
                         sf = cp.exp(-1.0 * dists * K_all[e_idx][None, :] * 1e-10)
                         output_ldos[:, e_idx] = cp.dot(sf.T, dos_active[:, e_idx])
@@ -525,7 +378,8 @@ class Unified_STM_Simulator:
             else:
                 output_ldos = cp.zeros((num_pts, num_e, self.num_total_atoms, dos_gpu.shape[2]), dtype=cp.float32)
                 if use_energy_decay:
-                    K_all = _leading_K(phi_local)
+                    e_arg = cp.maximum(calc_energies_gpu, 0.0) if clamp_occupied else calc_energies_gpu
+                    K_all = gpu_chen_tunneling_factor(cp.abs(calc_energies_gpu)[:, None], e_arg[:, None], phi_local)
                     for e_idx in range(num_e):
                         sf = cp.exp(-1.0 * dists * K_all[e_idx][None, :] * 1e-10)
                         w_atom = cp.dot(self.map_mat_gpu, sf)
@@ -605,8 +459,8 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
         self.npts = 72
         self.is_running, self.normalize, self.show_mag = False, False, False
         self.show_atoms, self.show_unit_cell = True, False
-        self.decay_tier = 'Off'    # §1 tier selector state; startup default Off
-        self.t2_clamp = False      # §1 'T2 0-clamp' checkbox state
+        self.use_decay = True
+        self.t2_clamp = False    # occupied-side 0-clamp (active only with Decay on)
         self.reuse_cache = True
         self.show_decay_toggle = True
         self.display_cells = 1
@@ -656,9 +510,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
         if topo_bias is None or topo_bias == 0:
             raise ValueError(f"topo_bias must be a nonzero bias voltage in volts; received {topo_bias!r}.")
         self.ldos_bias_sign = ldos_bias_sign
-        # use_decay is accepted for API compatibility but no longer selects the
-        # model: §1 fixes the startup default to the 'Off' tier, and from then
-        # on the tier selector / clamp widgets govern the effective model.
+        self.use_decay = use_decay
         self.reuse_cache = reuse_cache
         self.show_decay_toggle = bool(show_decay_toggle)
         if line_endpoints is not None:
@@ -723,17 +575,14 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
             z_map_gpu = cp.array(self.current_z_map, dtype=cp.float32)
         else:
             print(f"[*] Cache not found. Calculating Global Topography: {cache_name}")
-            dk = self._decay_call_kwargs(topo_bias)
             ld_1, _, init_engs = self._calculate_ldos_at_points_gpu(
                 cp.hstack([grid_xy_gpu, z_fixed[:, None]]), t_emin, t_emax,
-                preserve_orbitals=False, topo_only=True, **dk)
-            target_setp = self._topo_setpoint(ld_1, init_engs, topo_bias)
+                use_energy_decay=self.use_decay, preserve_orbitals=False, topo_only=True,
+                clamp_occupied=self.t2_clamp)
+            target_setp = cp.max(gpu_simpson(ld_1, init_engs))
             print(f"[*] Global Setpoint LDOS: {float(target_setp):.6e}")
             z_map_gpu = self._converge_tip_height(z_fixed, grid_xy_gpu, t_emin, t_emax, target_setp,
-                                                  use_decay=dk['use_energy_decay'],
-                                                  decay_mode=dk['decay_mode'],
-                                                  frozen_bias=dk['frozen_bias'],
-                                                  clamp_occupied=dk['clamp_occupied'])
+                                                  use_decay=self.use_decay, clamp_occupied=self.t2_clamp)
             self.current_z_map = cp.asnumpy(z_map_gpu)
             np.save(cache_name, self.current_z_map)
         self.grid_xy = grid_xy
@@ -1054,25 +903,22 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
         self.btn_run = Button(plt.axes([0.02, 0.02, 0.05, 0.06]), 'RUN', color='lightgray', hovercolor='lime')
         # One list defines every checkbox: label and the attribute it drives.
         # CheckButtons construction and the click handler both iterate this list.
-        toggle_defs = [('Atoms', 'show_atoms'),
+        toggle_defs = [('Atoms', 'show_atoms'), ('Decay', 'use_decay'),
                        ('Norm', 'normalize'), ('Mag', 'show_mag'),
                        ('Cell', 'show_unit_cell'), ('Extend', 'path_extend')]
+        if not getattr(self, 'show_decay_toggle', True):
+            toggle_defs = [d for d in toggle_defs if d[0] != 'Decay']
         self._toggle_defs = toggle_defs
         self.chk = CheckButtons(plt.axes([0.08, 0.02, 0.12, 0.092]),
                                 [label for label, _ in toggle_defs],
                                 [getattr(self, attr) for _, attr in toggle_defs])
-        # §1: the old Decay checkbox is replaced by a tier selector plus a
-        # 'T2 0-clamp' checkbox (clamp acts only under Tier 2, §0). Gated by
-        # show_decay_toggle exactly as the widget it replaces.
+        # 'T2 0-clamp': occupied-side 0-clamp for the energy-decay model.
+        # Visible only while the Decay toggle is on.
         if getattr(self, 'show_decay_toggle', True):
-            ax_tier = plt.axes([0.135, 0.90, 0.062, 0.08], facecolor='lightgray')
-            _tier_labels = ('Off', 'Tier 2', 'Tier 3')
-            self.ui_tier = RadioButtons(ax_tier, _tier_labels,
-                                        active=list(_tier_labels).index(self.decay_tier))
-            self.ui_tier.on_clicked(self._on_tier_change)
-            ax_clamp = plt.axes([0.203, 0.94, 0.08, 0.04])
+            ax_clamp = plt.axes([0.135, 0.94, 0.08, 0.04])
             self.chk_clamp = CheckButtons(ax_clamp, ['T2 0-clamp'], [self.t2_clamp])
             self.chk_clamp.on_clicked(self._on_clamp_change)
+            ax_clamp.set_visible(self.use_decay)
         self.s_cell = Slider(plt.axes([0.22, 0.05, 0.1, 0.03]), 'Cells', 0, 4, valinit=self.display_cells, valstep=1)
         self.s_emin = Slider(plt.axes([0.50, 0.05, 0.17, 0.02]), 'E Min', -5.0, 5.0, valinit=self.erange[0])
         self.s_emax = Slider(plt.axes([0.50, 0.02, 0.17, 0.02]), 'E Max', -5.0, 5.0, valinit=self.erange[1])
@@ -1257,17 +1103,14 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
             print(f"[*] Calculating Global Topography with broadening: {cache_name}")
             t_emin, t_emax = sorted([0.0, self.global_topo_bias])
             z_fixed = cp.full(self.grid_xy_gpu.shape[0], self.z_highest_atom + self.topo_height, dtype=cp.float32)
-            dk = self._decay_call_kwargs(self.global_topo_bias)
             ld_1, _, init_engs = self._calculate_ldos_at_points_gpu(
                 cp.hstack([self.grid_xy_gpu, z_fixed[:, None]]), t_emin, t_emax,
-                preserve_orbitals=False, topo_only=True, **dk)
-            target_setp = self._topo_setpoint(ld_1, init_engs, self.global_topo_bias)
+                use_energy_decay=self.use_decay, preserve_orbitals=False, topo_only=True,
+                clamp_occupied=self.t2_clamp)
+            target_setp = cp.max(gpu_simpson(ld_1, init_engs))
             print(f"[*] Global Setpoint LDOS: {float(target_setp):.6e}")
             z_map_gpu = self._converge_tip_height(z_fixed, self.grid_xy_gpu, t_emin, t_emax, target_setp,
-                                                  use_decay=dk['use_energy_decay'],
-                                                  decay_mode=dk['decay_mode'],
-                                                  frozen_bias=dk['frozen_bias'],
-                                                  clamp_occupied=dk['clamp_occupied'])
+                                                  use_decay=self.use_decay, clamp_occupied=self.t2_clamp)
             self.current_z_map = cp.asnumpy(z_map_gpu)
             np.save(cache_name, self.current_z_map)
         self.global_z_map = self.current_z_map.copy()
@@ -1329,25 +1172,13 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
             self._broadening_topo_dirty = False
             self._update_all(full_refresh=True)
 
-    def _on_tier_change(self, label):
-        """§1 tier selector callback (existing Decay-callback pattern)."""
-        prev_model = self._effective_decay_model()
-        self.decay_tier = label
-        if self._effective_decay_model() != prev_model:
-            self._on_decay_model_change()
-
     def _on_clamp_change(self, label):
-        """§1 'T2 0-clamp' callback. §0: the clamp has effect only under
-        Tier 2; under Off/Tier 3 its state is recorded but ignored."""
-        prev_model = self._effective_decay_model()
+        """Occupied-side 0-clamp toggle (checkbox visible only while Decay is
+        on). Switching it changes the decay model, so it follows the same
+        invalidate-and-recompute pattern as the Decay toggle."""
         self.t2_clamp = bool(self.chk_clamp.get_status()[0])
-        if self._effective_decay_model() != prev_model:
-            self._on_decay_model_change()
-
-    def _on_decay_model_change(self):
-        """§0/§1: effective-model change → clear all in-memory topo/display
-        state and recompute the current view under the new model (the existing
-        Decay-callback pattern, extended to both widgets)."""
+        if not self.use_decay:
+            return
         self.cached_p1 = self.cached_p2 = None
         self.cached_path_nodes = None
         self.cached_emin = self.cached_emax = None
@@ -1363,6 +1194,7 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
             self._update_all(full_refresh=True)
 
     def _on_ui_change(self, val):
+        prev_decay = self.use_decay
         prev_path_extend = self.path_extend
         states = self.chk.get_status()
         for (label, attr), state in zip(self._toggle_defs, states):
@@ -1371,10 +1203,12 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
         if hasattr(self, 's_ldos_gamma'):
             self.ldos_gamma = float(self.s_ldos_gamma.val)
         self._sync_textboxes()
+        # Show the 0-clamp checkbox only while Decay is on.
+        if hasattr(self, 'chk_clamp'):
+            self.chk_clamp.ax.set_visible(self.use_decay)
 
-        # Path-extend toggle: invalidate caches and recompute. (The decay-model
-        # controls have their own callbacks: _on_tier_change/_on_clamp_change.)
-        if self.path_extend != prev_path_extend:
+        # Decay toggle OR path-extend toggle: invalidate caches and recompute.
+        if (self.use_decay != prev_decay) or (self.path_extend != prev_path_extend):
             self.cached_p1 = self.cached_p2 = None
             self.cached_path_nodes = None
             self.cached_emin = self.cached_emax = None
@@ -1383,6 +1217,13 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
             self.cached_bias_energy_line = self.cached_bias_energy_map = None
             self.cached_marker_coords = self.cached_spec_ldos = None
             self.cached_ld_up = self.cached_ld_dn = None
+            # Only the decay toggle changes the global topo (recompute, or load
+            # the decay-tagged cache); path-extend does not.
+            if self.use_decay != prev_decay:
+                self._broadening_topo_dirty = True
+                if self.is_running:
+                    self._recompute_global_topo()
+                    self._broadening_topo_dirty = False
             if self.is_running:
                 self._update_all(full_refresh=True)
             return
@@ -1511,17 +1352,14 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
             if self.mode in ('Line', 'Path'):
                 l_emin, l_emax = sorted([0.0, bias_e])
                 p_xy_gpu = cp.array(p_xy, dtype=cp.float32)
-                dk = self._decay_call_kwargs(bias_e)
                 ld_1, _, l_engs = self._calculate_ldos_at_points_gpu(
                     cp.hstack([p_xy_gpu, cp.full((self.npts, 1), self.z_highest_atom + self.ldos_height, dtype=cp.float32)]),
-                    l_emin, l_emax, preserve_orbitals=False, topo_only=True, **dk)
-                target = self._topo_setpoint(ld_1, l_engs, bias_e)
+                    l_emin, l_emax, use_energy_decay=self.use_decay, preserve_orbitals=False, topo_only=True,
+                    clamp_occupied=self.t2_clamp)
+                target = cp.max(gpu_simpson(ld_1, l_engs))
                 print(f"[*] Path Setpoint LDOS: {float(target):.6e}")
                 z_line = self._converge_tip_height(cp.full(self.npts, self.z_highest_atom + self.ldos_height, dtype=cp.float32), p_xy_gpu, l_emin, l_emax, target,
-                                                   use_decay=dk['use_energy_decay'],
-                                                   decay_mode=dk['decay_mode'],
-                                                   frozen_bias=dk['frozen_bias'],
-                                                   clamp_occupied=dk['clamp_occupied'])
+                                                   use_decay=self.use_decay, clamp_occupied=self.t2_clamp)
                 self.current_z_line = cp.asnumpy(z_line)
                 if self.mode == 'Line':
                     self.cached_p1, self.cached_p2 = self.p1.copy(), self.p2.copy()
@@ -1539,17 +1377,14 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
                 else:
                     print(f"[*] Cache not found. Calculating LDOS Topography: {ldos_cache_name}")
                     z_fixed = cp.full(self.grid_xy_gpu.shape[0], self.z_highest_atom + self.ldos_height, dtype=cp.float32)
-                    dk = self._decay_call_kwargs(bias_e)
                     ld_1, _, init_engs = self._calculate_ldos_at_points_gpu(
                         cp.hstack([self.grid_xy_gpu, z_fixed[:, None]]), t_emin, t_emax,
-                        preserve_orbitals=False, topo_only=True, **dk)
-                    target_setp = self._topo_setpoint(ld_1, init_engs, bias_e)
+                        use_energy_decay=self.use_decay, preserve_orbitals=False, topo_only=True,
+                        clamp_occupied=self.t2_clamp)
+                    target_setp = cp.max(gpu_simpson(ld_1, init_engs))
                     print(f"[*] Map Local Setpoint LDOS: {float(target_setp):.6e}")
                     z_map_gpu = self._converge_tip_height(z_fixed, self.grid_xy_gpu, t_emin, t_emax, target_setp,
-                                                          use_decay=dk['use_energy_decay'],
-                                                          decay_mode=dk['decay_mode'],
-                                                          frozen_bias=dk['frozen_bias'],
-                                                          clamp_occupied=dk['clamp_occupied'])
+                                                          use_decay=self.use_decay, clamp_occupied=self.t2_clamp)
                     self.current_z_map = cp.asnumpy(z_map_gpu)
                     np.save(ldos_cache_name, self.current_z_map)
                 self.cached_bias_energy_map, self.cached_d_topo_map = bias_e, decay_model
@@ -1567,7 +1402,8 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
                 ld_up, ld_dn, eg = self._calculate_ldos_at_points_gpu(
                     np.hstack([p_xy, self.current_z_line[:, None]]),
                     self.s_emin.val, self.s_emax.val,
-                    preserve_orbitals=True, **self._decay_call_kwargs())
+                    use_energy_decay=self.use_decay, preserve_orbitals=True,
+                    clamp_occupied=self.t2_clamp)
             elif self.mode == 'Map':
                 self.map_e_targets = np.linspace(self.s_emin.val, self.s_emax.val, nepts)
                 eg = cp.array(self.energies[np.searchsorted(self.energies, self.s_emin.val):np.searchsorted(self.energies, self.s_emax.val, side='right')])
@@ -1578,7 +1414,8 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
                     t_up, t_dn, _ = self._calculate_ldos_at_points_gpu(
                         grid_z, self.energies[e_idx],
                         self.energies[min(e_idx + 1, len(self.energies) - 1)] + 1e-6,
-                        preserve_orbitals=True, **self._decay_call_kwargs())
+                        use_energy_decay=self.use_decay, preserve_orbitals=True,
+                        clamp_occupied=self.t2_clamp)
                     ld_up_list.append(t_up[:, 0:1])
                     if t_dn is not None:
                         ld_dn_list.append(t_dn[:, 0:1])
@@ -1612,7 +1449,8 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
             pt_gpu = cp.array(np.hstack([m_coords, z_marks[:, None]]), dtype=cp.float32)
             s_up, s_dn, _ = self._calculate_ldos_at_points_gpu(
                 pt_gpu, self.s_emin.val, self.s_emax.val,
-                preserve_orbitals=True, **self._decay_call_kwargs())
+                use_energy_decay=self.use_decay, preserve_orbitals=True,
+                clamp_occupied=self.t2_clamp)
             s_up_np = cp.asnumpy(s_up)
             s_dn_np = cp.asnumpy(s_dn) if s_dn is not None else None
 
@@ -2239,7 +2077,8 @@ class Interactive_STM_Simulator(Unified_STM_Simulator):
             t_up, t_dn, _ = self._calculate_ldos_at_points_gpu(
                 grid_z, self.energies[e_idx],
                 self.energies[min(e_idx + 1, len(self.energies) - 1)] + 1e-6,
-                preserve_orbitals=True, **self._decay_call_kwargs())
+                use_energy_decay=self.use_decay, preserve_orbitals=True,
+                clamp_occupied=self.t2_clamp)
             self.cached_ld_up[:, idx:idx + 1] = cp.asnumpy(t_up[:, 0:1])
             if t_dn is not None and self.cached_ld_dn is not None:
                 self.cached_ld_dn[:, idx:idx + 1] = cp.asnumpy(t_dn[:, 0:1])
